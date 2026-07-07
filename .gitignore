@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS junk
+.DS_Store
+
+# Any stray data files that end up in here
+*.fits
+
+# Editor/environment
+.env
