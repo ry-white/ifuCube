@@ -301,7 +301,7 @@ def backproject(A: sparse.csr_matrix, cube_flux: np.ndarray) -> np.ndarray:
     
     C = cube_flux.reshape(L, P) # (L, P) lambda, pixel
     F_hat = (A.T @ C.T)         # (L, K) lambda, fiber
-    return F_hat.t              # (K, L) fiber, lambda
+    return F_hat.T             # (K, L) fiber, lambda
     
     
 

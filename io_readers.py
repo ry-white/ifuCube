@@ -65,7 +65,7 @@ def fibers_from_arrays(
     wave: np.ndarray,
     x_arcsec: np.ndarray,
     y_arcsec: np.ndarray,
-    meta: Optional[Disct[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> FiberSet:
     """
     Wrap in-memory arrays into a FiberSet
