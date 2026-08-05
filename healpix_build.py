@@ -544,7 +544,7 @@ def crossmatch_catalog_to_healpix(
         MEAN_VALUE        : (weighted) mean of value_col over matched pixels
         SUMMED_WEIGHT     : summed weight_col over matched pixels
     """
-    from astropy.table import Table
+    from astropy.table import Table, unique 
     from astropy.coordinates import SkyCoord
     from astropy_healpix import HEALPix, nside_to_pixel_area
 
@@ -641,10 +641,10 @@ def crossmatch_catalog_to_healpix(
 def find_matching_pointings(
     pointings,
     catalog,
-    pointing_ra_col: str = "ra",
+    pointing_ra_col: str = "sci_ra",
     pointing_dec_col: str = "dec",
-    catalog_ra_col: str = "RAJ2000",
-    catalog_dec_col: str = "DEJ2000",
+    catalog_ra_col: str = "_RA_icrs",
+    catalog_dec_col: str = "_DE_icrs",
     catalog_radius_col: Optional[str] = None,
     catalog_radius_unit: str = "arcsec",
     default_catalog_radius_arcsec: float = 30.0,
@@ -812,6 +812,7 @@ def download_lvm_files(
         Local file paths (existing after a real run; the paths *would*
         exist after a dry run).
     """
+    # Need to implement HTTP access, as rsync doesn't seem to work.
     from sdss_access import Access
 
     a = Access(release=release)
