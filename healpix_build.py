@@ -149,7 +149,7 @@ def wcs_map_to_healpix(
     else:
         w = np.ones_like(values)
 
-    good = np.isfinite(values) & np.isfinite(w) & (w >= 0)
+    good = np.isfinite(values) & np.isfinite(w) & (w > 0)
     pix = pix[good]
     values = values[good]
     w = w[good]
@@ -435,7 +435,7 @@ def merge_healpix_tables(
             nsamp_col = "NSAMP" if "NSAMP" in tbl.columns.names else None
             nsamp = np.asarray(tbl[nsamp_col], np.int64) if nsamp_col else np.ones_like(pix)
 
-            good = np.isfinite(val) & np.isfinite(w) & (w >= 0)
+            good = np.isfinite(val) & np.isfinite(w) & (w > 0)
             for p, v, wi, n in zip(pix[good], val[good], w[good], nsamp[good]):
                 pix_val_sums[p] = pix_val_sums.get(p, 0.0) + v * wi
                 pix_wsums[p] = pix_wsums.get(p, 0.0) + wi
@@ -544,7 +544,7 @@ def crossmatch_catalog_to_healpix(
         MEAN_VALUE        : (weighted) mean of value_col over matched pixels
         SUMMED_WEIGHT     : summed weight_col over matched pixels
     """
-    from astropy.table import Table, unique 
+    from astropy.table import Table
     from astropy.coordinates import SkyCoord
     from astropy_healpix import HEALPix, nside_to_pixel_area
 
@@ -609,7 +609,7 @@ def crossmatch_catalog_to_healpix(
 
         w = weights[matched]
         v = values[matched]
-        good = np.isfinite(v) & np.isfinite(w) & (w >= 0)
+        good = np.isfinite(v) & np.isfinite(w) & (w > 0)
         wsum = float(np.sum(w[good]))
         mean_val = float(np.sum(v[good] * w[good]) / wsum) if wsum > 0 else float("nan")
 
@@ -641,10 +641,10 @@ def crossmatch_catalog_to_healpix(
 def find_matching_pointings(
     pointings,
     catalog,
-    pointing_ra_col: str = "sci_ra",
+    pointing_ra_col: str = "ra",
     pointing_dec_col: str = "dec",
-    catalog_ra_col: str = "_RA_icrs",
-    catalog_dec_col: str = "_DE_icrs",
+    catalog_ra_col: str = "RAJ2000",
+    catalog_dec_col: str = "DEJ2000",
     catalog_radius_col: Optional[str] = None,
     catalog_radius_unit: str = "arcsec",
     default_catalog_radius_arcsec: float = 30.0,
@@ -760,8 +760,12 @@ def download_lvm_files(
     column_map: Dict[str, str],
     filetype: str = "lvm_sframe",
     release: str = "sdsswork",
+    method: str = "rsync",
+    fixed_kwargs: Optional[Dict[str, object]] = None,
     username: Optional[str] = None,
     password: Optional[str] = None,
+    skip_missing: bool = False,
+    skip_existing_local: bool = True,
     dry_run: bool = True,
 ):
     """
@@ -770,83 +774,341 @@ def download_lvm_files(
     file-path templates into real SAS locations and handles the transfer.
 
     This is a thin wrapper -- it does the bookkeeping of turning table rows
-    into the right `Access.add()` calls, plus a dry-run mode so you can see
+    into the right sdss_access calls, plus a dry-run mode so you can see
     exactly what would be fetched before committing to a real download.
 
     Parameters
     ----------
     matched_pointings : astropy.table.Table or dict-like of columns
         Typically the first return value of find_matching_pointings(), or
-        any table with one row per observation you want to fetch.
+        any table with one row per observation you want to fetch. If a
+        pointing can have multiple rows (e.g. repeat exposures sharing the
+        same tileid), deduplicate however is appropriate for your use case
+        *before* calling this -- e.g. `astropy.table.unique(matched, keys="tileid")`
+        -- since every row here becomes one fetched file.
     column_map : dict
-        Maps each keyword required by `filetype`'s path template to the
-        column name in `matched_pointings` that holds it. Required keys
-        depend on filetype -- e.g. for "lvm_sframe": mjd, drpver, tileid,
-        expnum. Use `sdss_access.Access(release=release).lookup_keys(filetype)`
-        yourself first if you're not sure what's required for a different
-        filetype (e.g. "lvm_dap" needs more keys: tileid, dapver, expnum,
-        snlevel, daptype, rspid, drpver, mjd).
+        Maps each *per-row-varying* keyword required by `filetype`'s path
+        template to the column name in `matched_pointings` that holds it.
+        Use `fixed_kwargs` instead for keywords that are the same for
+        every file (see below) -- every key `filetype` requires must be
+        covered by column_map or fixed_kwargs, or this raises an error
+        telling you what's missing.
+    fixed_kwargs : dict, optional
+        Constant values for keywords required by `filetype`'s path
+        template that are *not* per-pointing properties -- e.g. for
+        "lvm_dap": dapver, rspid, snlevel, daptype are DAP-run
+        configuration choices, not columns you'd find in a drpall-style
+        table (unlike tileid/mjd/expnum/drpver, which do vary per row and
+        belong in column_map). Figure these out from an example DAP
+        filename you already have (they're literally embedded in it:
+        "dap-{rspid}-{snlevel}-{expnum}.{daptype}.fits", e.g.
+        "dap-rsp108-sn20-00004163.dap.fits.gz" -> rspid="rsp108",
+        snlevel="sn20", daptype="dap") or from LVM_SPECTRO_ANALYSIS/<dapver>/
+        on disk if you have access to browse it.
     filetype : str
         sdss_access path-template name. Common LVM ones: "lvm_sframe"
         (calibrated row-stacked spectra -- what build.py's `cube` command
         reads), "lvm_dap" (per-line fit outputs -- what `dap-maps` reads),
-        "lvm_drpall" (the observation summary table itself).
+        "lvm_drpall" (the DRP observation summary table), "lvm_dapall"
+        (the DAP-level summary table).
     release : str
         sdss_access release tag. Use whatever matches your access level --
         "sdsswork" or an "ipl-N" string for internal/collaboration access,
         a "DRxx" string once data is public. Check
         `sdss_access.Access.get_available_releases()` for valid values.
+    method : {"rsync", "http"}
+        Transfer backend. "rsync" (default) always connects to
+        dtn.sdss.org, a dedicated transfer node -- fast, resumable,
+        parallelized, but that specific host/port must be reachable from
+        your network (often needs a VPN for off-site access). "http" uses
+        data.sdss.org / data.sdss5.org instead, over HTTPS -- slower (one
+        file at a time, no delta-transfer), but works through networks
+        that only allow standard web ports outbound.
     username, password : str, optional
         SDSS SAS credentials. If both are None, sdss_access falls back to
         prompting interactively or reading a configured ~/.netrc -- if
         you've already got LVM access working some other way, you likely
         already have this set up and can leave these as None.
+    skip_missing : bool
+        Not every exposure necessarily has output for every filetype --
+        e.g. DAP is often only run on a subset of exposures meeting some
+        S/N threshold. If True, each requested file's *remote* existence
+        is checked (via Access.exists(..., remote=True)) before it's
+        queued, and missing ones are dropped with a printed count rather
+        than failing the whole batch partway through a transfer. This
+        requires a network call to the server regardless of `dry_run`
+        (existence-checking is inherently a remote query) -- but no file
+        data is transferred by the check itself, and `dry_run=True` still
+        guarantees no *file* is downloaded, only that existence gets
+        checked. Leave False if you already know every row has data (e.g.
+        you already filtered on this some other way), to skip the extra
+        round-trip per file.
+    skip_existing_local : bool
+        If True (the default), each row's local destination path (from
+        a.full()) is checked with a plain os.path.exists() *before* any
+        network call at all -- rows already present on disk are dropped
+        from the batch entirely, so re-running this on a partially
+        downloaded set doesn't re-fetch what you already have. This is a
+        local filesystem check only (no network), so it always runs
+        regardless of dry_run, and runs before the (network-requiring)
+        skip_missing check above -- no point spending a round-trip
+        confirming remote existence for a file you already have locally.
     dry_run : bool
         If True (the default -- deliberately safe), only prints what would
-        be downloaded and where it would land locally; makes no network
-        calls. Set False to actually fetch the files.
+        be downloaded and where it would land locally; makes no file-
+        transfer network calls (though see skip_missing above -- existence
+        checks are a partial exception). Set False to actually fetch.
 
     Returns
     -------
     destinations : list of str
-        Local file paths (existing after a real run; the paths *would*
-        exist after a dry run).
+        Local file paths for the rows actually queued (existing after a
+        real run; the paths *would* exist after a dry run). Rows dropped
+        by skip_missing are not included.
     """
-    # Need to implement HTTP access, as rsync doesn't seem to work.
-    from sdss_access import Access
+    if method not in ("rsync", "http"):
+        raise ValueError(f"method must be 'rsync' or 'http', got {method!r}")
 
-    a = Access(release=release)
+    fixed_kwargs = fixed_kwargs or {}
+    overlap = set(column_map) & set(fixed_kwargs)
+    if overlap:
+        raise ValueError(f"key(s) {overlap} given in both column_map and fixed_kwargs -- pick one")
+
+    if method == "rsync":
+        from sdss_access import Access as _AccessCls
+    else:
+        from sdss_access import HttpAccess as _AccessCls
+
+    a = _AccessCls(release=release)
     required_keys = a.lookup_keys(filetype)
-    missing = [k for k in required_keys if k not in column_map]
-    if missing:
+    missing_keys = [k for k in required_keys if k not in column_map and k not in fixed_kwargs]
+    if missing_keys:
         raise ValueError(
-            f"column_map is missing required key(s) for filetype={filetype!r}: {missing}. "
-            f"Full requirement: {required_keys}"
+            f"filetype={filetype!r} needs key(s) {missing_keys} not covered by column_map or "
+            f"fixed_kwargs. Full requirement: {required_keys}"
         )
 
     n = len(matched_pointings)
     destinations = []
     row_kwargs_list = []
     for i in range(n):
-        row_kwargs = {k: matched_pointings[column_map[k]][i] for k in required_keys}
+        row_kwargs = {
+            k: (matched_pointings[column_map[k]][i] if k in column_map else fixed_kwargs[k])
+            for k in required_keys
+        }
         row_kwargs_list.append(row_kwargs)
-        dest = a.full(filetype, **row_kwargs)
-        destinations.append(dest)
+        destinations.append(a.full(filetype, **row_kwargs))
+
+    if skip_existing_local:
+        import os as _os
+        kept_kwargs, kept_dest = [], []
+        n_already_have = 0
+        for kwargs, dest in zip(row_kwargs_list, destinations):
+            if _os.path.exists(dest):
+                n_already_have += 1
+            else:
+                kept_kwargs.append(kwargs)
+                kept_dest.append(dest)
+        print(f"[skip_existing_local] {n_already_have} of {n} already on disk -- dropped")
+        row_kwargs_list, destinations = kept_kwargs, kept_dest
+        n = len(destinations)
+
+    if skip_missing:
+        # exists(remote=True) always issues an HTTP HEAD request under the
+        # hood, regardless of `method` -- with method="rsync" it builds an
+        # rsync:// URL that the requests library can't handle at all
+        # (InvalidSchema). So the existence check always goes over HTTP,
+        # separately from whatever `method` is used for the real transfer
+        # below. Reuse `a` if it's already an HttpAccess; otherwise spin up
+        # a dedicated one just for this check.
+        from sdss_access import HttpAccess
+        checker = a if method == "http" else HttpAccess(release=release)
+        checker.remote(username=username, password=password)
+
+        kept_kwargs, kept_dest = [], []
+        n_missing = 0
+        for kwargs, dest in zip(row_kwargs_list, destinations):
+            if checker.exists(filetype, remote=True, **kwargs):
+                kept_kwargs.append(kwargs)
+                kept_dest.append(dest)
+            else:
+                n_missing += 1
+        print(f"[skip_missing] {n_missing} of {n} have no remote {filetype!r} file -- dropped")
+        row_kwargs_list, destinations = kept_kwargs, kept_dest
+        n = len(destinations)
 
     if dry_run:
-        print(f"[dry run] {n} file(s) would be fetched (filetype={filetype}, release={release}):")
+        print(
+            f"[dry run] {n} file(s) would be fetched via {method} "
+            f"(filetype={filetype}, release={release}):"
+        )
         for kwargs, dest in zip(row_kwargs_list, destinations):
             print(f"    {kwargs} -> {dest}")
         print("Re-run with dry_run=False to actually download.")
         return destinations
 
-    a.remote(username=username, password=password, inquire=(username is None and password is None))
-    for kwargs in row_kwargs_list:
-        a.add(filetype, **kwargs)
-    a.set_stream()
-    a.commit()
-    print(f"[ok] Downloaded {n} file(s) via sdss_access (filetype={filetype}, release={release})")
+    if method == "rsync":
+        a.remote(username=username, password=password, inquire=(username is None and password is None))
+        for kwargs in row_kwargs_list:
+            a.add(filetype, **kwargs)
+        a.set_stream()
+        a.commit()
+    else:
+        a.remote(username=username, password=password)
+        for kwargs in row_kwargs_list:
+            a.get(filetype, **kwargs)
+
+    print(f"[ok] Downloaded {n} file(s) via {method} (filetype={filetype}, release={release})")
     return destinations
+
+
+def plot_matched_regions(
+    healpix_fits: str | Path,
+    catalog,
+    ra_col: str = "RAJ2000",
+    dec_col: str = "DEJ2000",
+    name_col: Optional[str] = None,
+    radius_col: Optional[str] = None,
+    radius_unit: str = "arcsec",
+    default_radius_arcsec: float = 30.0,
+    value_col: str = "VALUE",
+    min_matched_pixels: int = 1,
+    max_plots: int = 12,
+    sort_by_size: bool = True,
+    ncols: int = 4,
+    panel_size: float = 3.0,
+):
+    """
+    Plot one small close-up panel per catalog source actually covered by a
+    HEALPix table, instead of one crowded whole-sky scatter -- useful when
+    your footprint is many separate small regions (e.g. several HII
+    regions scattered across the sky) rather than one contiguous patch.
+
+    Uses the same matching approach as crossmatch_catalog_to_healpix (see
+    that function's docstring for the full design rationale): a cheap
+    bounding-circle pre-filter, then per-candidate separation against your
+    own footprint pixels directly -- no full-sky HEALPix array involved.
+
+    Parameters
+    ----------
+    healpix_fits, catalog, ra_col, dec_col, name_col, radius_col,
+    radius_unit, default_radius_arcsec, value_col, min_matched_pixels :
+        Same meaning as in crossmatch_catalog_to_healpix -- see there for
+        details.
+    max_plots : int
+        Cap on how many matched regions to actually plot (matches beyond
+        this are still counted/reported, just not drawn -- avoids
+        accidentally building a huge figure).
+    sort_by_size : bool
+        If True (default), matches are sorted by number of matched pixels
+        (descending) before applying max_plots -- so you see the
+        largest/best-covered regions first rather than whatever order
+        they happened to be matched in. Set False to keep catalog order.
+    ncols : int
+        Number of panels per row in the grid.
+    panel_size : float
+        Size (inches) of each square-ish panel.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure, or None if there were no matches.
+    """
+    import matplotlib.pyplot as plt
+    from astropy.coordinates import SkyCoord
+    from astropy_healpix import HEALPix
+
+    with fits.open(healpix_fits, memmap=False) as hdul:
+        hdr = hdul[0].header
+        tbl = hdul[1].data
+
+    nside = int(hdr["NSIDE"])
+    nested = hdr["ORDERING"].strip().upper() == "NESTED"
+    coordsys = hdr["COORDSYS"].strip().lower()
+
+    hp_grid = HEALPix(nside=nside, order="nested" if nested else "ring", frame=coordsys)
+    footprint_pix = tbl["PIXEL"].astype(np.int64)
+    footprint_lon, footprint_lat = hp_grid.healpix_to_lonlat(footprint_pix)
+    footprint_coord = SkyCoord(footprint_lon, footprint_lat, frame=coordsys)
+    values = np.asarray(tbl[value_col], float)
+
+    centroid = SkyCoord(np.mean(footprint_lon), np.mean(footprint_lat), frame=coordsys)
+    footprint_radius_arcsec = float(centroid.separation(footprint_coord).to(u.arcsec).value.max())
+
+    cat_ra = np.asarray(catalog[ra_col], float)
+    cat_dec = np.asarray(catalog[dec_col], float)
+    n_cat = cat_ra.size
+
+    if radius_col is not None:
+        raw_radius = np.asarray(catalog[radius_col], float)
+        radius_arcsec = (raw_radius * u.Unit(radius_unit)).to(u.arcsec).value
+    else:
+        radius_arcsec = np.full(n_cat, float(default_radius_arcsec))
+
+    cat_coord = SkyCoord(cat_ra * u.deg, cat_dec * u.deg, frame="icrs")
+    if coordsys != "icrs":
+        cat_coord = cat_coord.transform_to(coordsys)
+
+    sep_to_centroid = centroid.separation(cat_coord).to(u.arcsec).value
+    candidate_idx = np.nonzero(sep_to_centroid <= (footprint_radius_arcsec + radius_arcsec))[0]
+
+    matches = []  # list of (name, matched_lon_deg, matched_lat_deg, matched_values)
+    for i in candidate_idx:
+        sep = cat_coord[i].separation(footprint_coord).to(u.arcsec).value
+        matched = sep <= radius_arcsec[i]
+        if np.count_nonzero(matched) < min_matched_pixels:
+            continue
+        name = str(catalog[name_col][i]) if name_col is not None else f"src{i}"
+        matches.append((
+            name,
+            footprint_lon.to(u.deg).value[matched],
+            footprint_lat.to(u.deg).value[matched],
+            values[matched],
+        ))
+
+    print(f"[ok] {len(matches)} catalog source(s) covered by this footprint")
+    if not matches:
+        return None
+    if sort_by_size:
+        matches.sort(key=lambda m: m[1].size, reverse=True)  # m[1] is the matched-lon array
+    if len(matches) > max_plots:
+        print(f"[note] plotting the {'largest' if sort_by_size else 'first'} {max_plots} "
+              f"of {len(matches)} matches (max_plots={max_plots})")
+    to_plot = matches[:max_plots]
+
+    nrows = int(np.ceil(len(to_plot) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(panel_size * ncols, panel_size * nrows), squeeze=False)
+
+    from astropy_healpix import nside_to_pixel_resolution
+    min_half_width_deg = max(3.0, nside_to_pixel_resolution(nside).to(u.arcsec).value * 3) / 3600.0
+
+    for ax_idx, (name, lon, lat, val) in enumerate(to_plot):
+        ax = axes[ax_idx // ncols][ax_idx % ncols]
+        sca = ax.scatter(lon, lat, c=val, s=10, cmap="inferno")
+        ax.set_title(name, fontsize=9)
+
+        # Explicit, bounded window instead of matplotlib's autoscale+forced
+        # aspect: with very few matched pixels (near-degenerate matches
+        # that barely clip a footprint edge), autoscale-then-aspect can
+        # blow the view out to a nonsensical scale (confirmed: a single
+        # point can autoscale to a ~30 deg wide window once a fixed
+        # aspect ratio is applied). Centering on the data with a floor on
+        # the half-width avoids that regardless of point count.
+        lon_c, lat_c = float(np.mean(lon)), float(np.mean(lat))
+        cosdec = np.cos(np.deg2rad(lat_c)) or 1.0
+        half_lon = max(np.ptp(lon) / 2 / cosdec, min_half_width_deg) * 1.3 if lon.size else min_half_width_deg
+        half_lat = max(np.ptp(lat) / 2, min_half_width_deg) * 1.3 if lat.size else min_half_width_deg
+        ax.set_xlim(lon_c + half_lon, lon_c - half_lon)  # RA increases to the left
+        ax.set_ylim(lat_c - half_lat, lat_c + half_lat)
+        ax.set_aspect(1.0 / cosdec)
+
+        ax.tick_params(labelsize=7)
+        plt.colorbar(sca, ax=ax, fraction=0.046)
+
+    for ax_idx in range(len(to_plot), nrows * ncols):
+        axes[ax_idx // ncols][ax_idx % ncols].axis("off")
+
+    fig.tight_layout()
+    return fig
 
 
 def main() -> None:
@@ -887,4 +1149,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
