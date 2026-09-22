@@ -16,10 +16,10 @@ example run
 
 # Mosaic Halpha maps (FLUX HDU) using IVAR weights, conserve integrated flux:
 python -m ifuCube.mosaic \
-  --inputs lvmDAPMaps-00020509.fits lvmDAPMaps-00020501.fits lvmDAPMaps-00006588.fits lvmDAPMaps-00006660.fits lvmDAPMaps-00006426.fits \
+  --inputs lvmDAPMaps-00006112.fits lvmDAPMaps-00006113.fits lvmDAPMaps-00006114.fits lvmDAPMaps-00006115.fits lvmDAPMaps-00006116.fits lvmDAPMaps-00006117.fits \
   --hdu FLUX --weights-hdu IVAR \
-  --output mosaic_cube.fits \
-  --mode map \
+  --output mosaic_rosette.fits \
+  --mode cube \
   --auto-wcs \
   --combine mean \
   --reproject exact \
@@ -36,6 +36,7 @@ python -m ifuCube.mosaic \
   --reproject exact \
   --flux-per-pixel
 
+When mosaicing multi-line maps, use mode cube
 When mosaicing ratio maps do NOT use flux-per-pixel (dimensionless)
 """
 

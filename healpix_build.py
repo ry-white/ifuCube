@@ -186,7 +186,7 @@ def wcs_fits_to_healpix_table(
     hdu: str | int = "FLUX",
     weights_hdu: Optional[str | int] = None,
     nested: bool = True,
-    coord_system_out: str = "icrs",
+    coord_system_out: str = "icrs", # or galactic
     extra_header: Optional[dict] = None,
 ) -> None:
     """

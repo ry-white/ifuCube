@@ -15,12 +15,19 @@ Examples:
 
     # Build DAP maps
     python -m ifuCube.build dap-maps \
-        --dap dap/dap-rsp108-sn20-00004297.dap.fits.gz \
+        --dap dap/dap-rsp108-sn20-00006112.dap.fits.gz \
         --fibermap /home/rwhite/lvmcore/metrology/lvm_fiducial_fibermap.yaml \
         --out lvmDAPMaps-00004297.fits \
         --lines Halpha [NII]6583 [SII]6716 [SII]6731 \
         --pix 2.0 --fwhm 3.2 --frad 18.5 --rsigma 3 --kernel gauss
 
+    python -m ifuCube.build dap-maps \
+        --dap ~/sas/sdsswork/lvm/spectro/analysis/1.2.1/0011XX/11111/60222/00006117/dap-rsp108-sn20-00006117.dap.fits.gz \
+        --fibermap /home/rwhite/lvmcore/metrology/lvm_fiducial_fibermap.yaml \
+        --out lvmDAPMaps-00006117.fits \
+        --lines Halpha [NII]6583 [OIII]5007 \
+        --pix 2.0 --fwhm 3.2 --frad 18.5 --rsigma 3 --kernel gauss
+    
     # Build cube from SFrame
     python -m ifuCube.build cube \
         --sframe sframe/lvmSFrame-00003299.fits \
