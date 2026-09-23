@@ -59,13 +59,13 @@ def make_grid_from_points(
     x = np.asarray(x_arcsec, float)
     y = np.asarray(y_arcsec, float)
     ps = float(pixel_size_arcsec)
-    #R = float(fiber_radius_arcsec)
+    R = float(fiber_radius_arcsec)
 
     # construct grid using max x and y values and pad by fiber radius
-    x_min = x.min() #- R
-    x_max = x.max() #+ R
-    y_min = y.min() #- R
-    y_max = y.max() #+ R
+    x_min = x.min() - R
+    x_max = x.max() + R
+    y_min = y.min() - R
+    y_max = y.max() + R
 
     xg = np.arange(x_min, x_max + ps, ps)
     yg = np.arange(y_min, y_max + ps, ps)
@@ -84,11 +84,12 @@ def make_grid_from_points(
     cx, cy = poly.mean(axis=0)
     v = poly - np.array([cx, cy])
     r = np.hypot(v[:, 0], v[:, 1]) + 1e-9 # avoid divide by 0
-    scale = (r + 2) / r # got rid of scale R, scale = (r + R)/r, works fine like this! 
+    scale = (r + R) / r # got rid of scale R, scale = (r + R)/r, works fine like this! 
     poly_expanded = np.column_stack([cx + v[:, 0] * scale,
                                      cy + v[:, 1] * scale])
 
     X, Y = np.meshgrid(xg, yg)
+    poly_expanded = np.vstack([poly_expanded, poly_expanded[:1]])
     path = MplPath(poly_expanded, closed=True)
     inside = path.contains_points(
         np.column_stack([X.ravel(), Y.ravel()])
@@ -234,4 +235,13 @@ def make_wcs3d(celestial_wcs: WCS, wave: np.ndarray) -> WCS:
 
     w3d.wcs.cd = cd3
     return w3d
+
+def radec_to_tangent_arcsec(ra_deg, dec_deg):
+    """Exact tangent-plane offsets (arcsec) about the field's mean direction."""
+    c = SkyCoord(np.asarray(ra_deg) * u.deg, np.asarray(dec_deg) * u.deg, frame="icrs")
+    v = c.cartesian.xyz.value.mean(axis=1)
+    center = SkyCoord(np.arctan2(v[1], v[0]) * u.rad,
+                      np.arctan2(v[2], np.hypot(v[0], v[1])) * u.rad, frame="icrs")
+    off = c.transform_to(center.skyoffset_frame())
+    return off.lon.to(u.arcsec).value, off.lat.to(u.arcsec).value
     

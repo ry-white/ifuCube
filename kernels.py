@@ -110,7 +110,7 @@ def build_projection_A(
         raise ValueError("x_arcsec and y_arcsec must have the same shapoe")
 
     sigma = _sigma_from_fwhm(fwhm_arcsec)
-    r_cap = min(r_sigma_mult * sigma, 1.2 * float(fiber_radius_arcsec))
+    r_cap = r_sigma_mult * sigma
 
     ny, nx = inside_mask.shape
     X, Y = np.meshgrid(xg, yg)

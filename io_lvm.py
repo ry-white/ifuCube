@@ -23,6 +23,7 @@ from astropy.io import fits
 import polars as pl
 
 from lvmdap.dap_tools import read_DAP_file
+from .geometry import radec_to_tangent_arcsec
 from .io_readers import FiberSet
 
 def read_lvm_sframe(
@@ -85,12 +86,7 @@ def read_lvm_sframe(
     ra = np.asarray(slitmap["ra"], float)[ok]
     dec = np.asarray(slitmap["dec"], float)[ok]
 
-    # focal plane coordinates
-    xpmm = joined["xpmm"].to_numpy()[ok]
-    ypmm = joined["ypmm"].to_numpy()[ok]
-
-    x_arcsec = xpmm * plate_scale_arcsec_per_mm
-    y_arcsec = ypmm * plate_scale_arcsec_per_mm
+    x_arcsec, y_arcsec = radec_to_tangent_arcsec(ra, dec)
 
     return FiberSet(
         flux=flux,
@@ -168,12 +164,7 @@ def read_dap(
     ra = ra[ok]
     dec = dec[ok]
 
-    # focal plane coordinates
-    xpmm = joined["xpmm"].to_numpy()[ok]
-    ypmm = joined["ypmm"].to_numpy()[ok]
-
-    x_arcsec = xpmm * plate_scale_arcsec_per_mm
-    y_arcsec = ypmm * plate_scale_arcsec_per_mm
+    x_arcsec, y_arcsec = radec_to_tangent_arcsec(ra, dec)
 
     return FiberSet(
         flux=flux,      # (K, 1)
@@ -301,12 +292,7 @@ def read_dap_multi(
     ra = ra[ok]
     dec = dec[ok]
 
-    # focal plane coordinates
-    xpmm = joined["xpmm"].to_numpy()[ok]
-    ypmm = joined["ypmm"].to_numpy()[ok]
-
-    x_arcsec = xpmm * plate_scale_arcsec_per_mm
-    y_arcsec = ypmm * plate_scale_arcsec_per_mm
+    x_arcsec, y_arcsec = radec_to_tangent_arcsec(ra, dec)
 
     return FiberSet(
         flux=flux,      # (K_good, N_lines)

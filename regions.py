@@ -43,6 +43,8 @@ def fibers_in_polygon(
     x = np.asarray(x_arcsec, float)
     y = np.asarray(y_arcsec, float)
     poly = np.column_stack([poly_x, poly_y])
+    if not np.allclose(poly[0], poly[-1]):
+        poly = np.vstack([poly, poly[:1]])
     path = MplPath(poly, closed=True)
     pts = np.column_stack([x,y])
     return path.contains_points(pts)

@@ -186,7 +186,7 @@ def wcs_fits_to_healpix_table(
     hdu: str | int = "FLUX",
     weights_hdu: Optional[str | int] = None,
     nested: bool = True,
-    coord_system_out: str = "icrs", # or galactic
+    coord_system_out: str = "icrs",
     extra_header: Optional[dict] = None,
 ) -> None:
     """
@@ -862,9 +862,11 @@ def download_lvm_files(
     Returns
     -------
     destinations : list of str
-        Local file paths for the rows actually queued (existing after a
-        real run; the paths *would* exist after a dry run). Rows dropped
-        by skip_missing are not included.
+        Local paths of every requested file that is (or, for a dry run,
+        would be) on disk afterwards -- files that were already present
+        locally AND files downloaded in this call, in the input row order.
+        Rows dropped by skip_missing, or that failed to download, are not
+        included.
     """
     if method not in ("rsync", "http"):
         raise ValueError(f"method must be 'rsync' or 'http', got {method!r}")
@@ -899,13 +901,17 @@ def download_lvm_files(
         row_kwargs_list.append(row_kwargs)
         destinations.append(a.full(filetype, **row_kwargs))
 
+    import os as _os
+    all_dest = list(destinations)          # every requested file, in input order
+    already_local: list = []
+
     if skip_existing_local:
-        import os as _os
         kept_kwargs, kept_dest = [], []
         n_already_have = 0
         for kwargs, dest in zip(row_kwargs_list, destinations):
             if _os.path.exists(dest):
                 n_already_have += 1
+                already_local.append(dest)
             else:
                 kept_kwargs.append(kwargs)
                 kept_dest.append(dest)
@@ -945,7 +951,12 @@ def download_lvm_files(
         for kwargs, dest in zip(row_kwargs_list, destinations):
             print(f"    {kwargs} -> {dest}")
         print("Re-run with dry_run=False to actually download.")
-        return destinations
+        keep = set(already_local) | set(destinations)
+        return [d for d in all_dest if d in keep]
+
+    if not row_kwargs_list:
+        print(f"[ok] Nothing to download -- all {len(already_local)} requested file(s) already on disk")
+        return [d for d in all_dest if _os.path.exists(d)]
 
     if method == "rsync":
         a.remote(username=username, password=password, inquire=(username is None and password is None))
@@ -959,7 +970,7 @@ def download_lvm_files(
             a.get(filetype, **kwargs)
 
     print(f"[ok] Downloaded {n} file(s) via {method} (filetype={filetype}, release={release})")
-    return destinations
+    return [d for d in all_dest if _os.path.exists(d)]
 
 
 def plot_matched_regions(
@@ -1149,3 +1160,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
