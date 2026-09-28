@@ -15,11 +15,11 @@ Examples:
 
     # Build DAP maps
     python -m ifuCube.build dap-maps \
-        --dap dap/dap-rsp108-sn20-00006112.dap.fits.gz \
+        --dap dap-rsp108-sn20-00004297.dap.fits.gz \
         --fibermap /home/rwhite/lvmcore/metrology/lvm_fiducial_fibermap.yaml \
         --out lvmDAPMaps-00004297.fits \
-        --lines Halpha [NII]6583 [SII]6716 [SII]6731 \
-        --pix 2.0 --fwhm 3.2 --frad 18.5 --rsigma 3 --kernel gauss
+        --lines Halpha [NII]6583 [SII]6716 [SII]6731 [0III]5007 \
+        --pix 2.0 --fwhm 35 --frad 18.5 --rsigma 3 --kernel gauss
 
     python -m ifuCube.build dap-maps \
         --dap ~/sas/sdsswork/lvm/spectro/analysis/1.2.1/0011XX/11111/60222/00006117/dap-rsp108-sn20-00006117.dap.fits.gz \
@@ -50,11 +50,9 @@ import argparse
 from pathlib import Path
 from typing import Optional, Sequence
 
-import numpy as numpy
 from astropy.io import fits
-from astropy.wcs import wcs
 
-from ifuCube.io_lvm import read_dap_multi, read_lvm_sframe
+from ifuCube.io_lvm import read_dap_multi, read_lvm_sframe, LINE_DEFS
 from ifuCube.mapcat_build import build_map, save_map_to_fits
 from ifuCube.cube_build import build_cube, save_cube_to_fits
 from ifuCube.ratio import build_ratio_from_map_fits
@@ -63,26 +61,6 @@ from ifuCube.ratio import build_ratio_from_map_fits
 # Helpers 
 def _ensure_parent(path:Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-
-def _find_line_index(lines_hdu_data, name:str) -> int:
-    """
-    Try to find a line by name in the LINES table from header
-    Accepts exact matches 
-    """
-    if lines_hdu_data is None:
-        raise ValueError("Input file has no lines table; check map fits file")
-    
-    raw = lines_hdu_data["LINE_NAME"]
-    names = [str(x).strip() for x in raw]
-    if name in names:
-        return names.index(name)
-
-    # case-insensitive fallback, not sure if it works
-    low = [n.lower() for n in names]
-    if name.lower() in low:
-        return low.index(name.lower())
-    
-    raise ValueError(f"Line '{name}' not found in LINES table. Available lines: {names}")
 
 # Sub commands
 
@@ -95,7 +73,6 @@ def cmd_dap_maps(args: argparse.Namespace) -> None:
     fibers = read_dap_multi(
         dap_path=dap_path,
         fibermap_yaml=fibermap_yaml,
-        plate_scale_arcsec_per_mm=args.plate_scale,
         lines=args.lines,
     )
 
@@ -139,7 +116,7 @@ def cmd_ratio(args) -> None:
         neff_hdu=args.neff_hdu,
         lines_hdu=args.lines_hdu,
         min_den=args.min_den,
-    ),
+    )
     print(f"[✓] Ratio map written to {out_ratio}  ({args.num}/{args.den})")
 
 def cmd_cube(args: argparse.Namespace) -> None:
@@ -151,7 +128,6 @@ def cmd_cube(args: argparse.Namespace) -> None:
     fibers = read_lvm_sframe(
         sframe_path=sframe_path,
         fibermap_yaml=fibermap_yaml,
-        plate_scale_arcsec_per_mm=args.plate_scale,
     )
 
     result = build_cube(
@@ -189,13 +165,12 @@ def main() -> None:
     p_map.add_argument("--out", required=True, help="Output FITS map filename")
 
     p_map.add_argument("--lines", nargs="+", default=["Halpha"],
-                       help="Logical line names (must match LINE_DEFS keys)")
+                       help=f"Logical line names; choose from {sorted(LINE_DEFS)}")
     p_map.add_argument("--pix", type=float, default=2.0, help="Spaxel size in arcsec")
-    p_map.add_argument("--fwhm", type=float, default=3.2, help="Gaussian kernel FWHM in arcsec")
+    p_map.add_argument("--fwhm", type=float, default=3.2, help="Gaussian kernel FWHM in arcsec (set from fiber spacing ~35, not from --pix)")
     p_map.add_argument("--frad", type=float, default=18.5, help="Fibre radius in arcsec")
     p_map.add_argument("--rsigma", type=float, default=3.0, help="Sigma multiplier for kernel truncation")
     p_map.add_argument("--kernel", choices=["gauss", "tophat"], default="gauss")
-    p_map.add_argument("--plate-scale", type=float, default=8.6, help="arcsec/mm for xpmm/ypmm")
 
     p_map.set_defaults(func=cmd_dap_maps)
 
@@ -206,11 +181,10 @@ def main() -> None:
     p_cube.add_argument("--out", required=True, help="Output FITS cube filename")
 
     p_cube.add_argument("--pix", type=float, default=2.0, help="Spaxel size in arcsec")
-    p_cube.add_argument("--fwhm", type=float, default=3.2, help="Gaussian kernel FWHM in arcsec")
+    p_cube.add_argument("--fwhm", type=float, default=3.2, help="Gaussian kernel FWHM in arcsec (set from fiber spacing ~35, not from --pix)")
     p_cube.add_argument("--frad", type=float, default=18.5, help="Fibre radius in arcsec")
     p_cube.add_argument("--rsigma", type=float, default=3.0, help="Sigma multiplier for kernel truncation")
     p_cube.add_argument("--kernel", choices=["gauss", "tophat"], default="gauss")
-    p_cube.add_argument("--plate-scale", type=float, default=8.6, help="arcsec/mm for xpmm/ypmm")
 
     p_cube.set_defaults(func=cmd_cube)
 

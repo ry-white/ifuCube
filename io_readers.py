@@ -51,6 +51,41 @@ class FiberSet:
     y_arcsec: np.ndarray
     meta: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """
+        Check the five arrays agree with each other.
+
+        @dataclass runs this automatically after construction, so the checks
+        apply however a FiberSet is made -- previously they lived only in
+        fibers_from_arrays, which the LVM readers bypass by constructing
+        FiberSet directly. A shape mismatch here would otherwise surface much
+        later as an unrelated-looking error inside the projection.
+        """
+        flux = np.asarray(self.flux)
+        ivar = np.asarray(self.ivar)
+        wave = np.asarray(self.wave)
+        x = np.asarray(self.x_arcsec)
+        y = np.asarray(self.y_arcsec)
+
+        if flux.ndim != 2:
+            raise ValueError(f"flux must be 2D (fiber_n, wave_n), got {flux.shape}")
+        if ivar.shape != flux.shape:
+            raise ValueError(
+                f"ivar shape {ivar.shape} != flux shape {flux.shape}")
+        if wave.ndim != 1:
+            raise ValueError(f"wave must be 1D (wave_n,), got {wave.shape}")
+        if flux.shape[1] != wave.size:
+            raise ValueError(
+                f"flux.shape[1] ({flux.shape[1]}) != wave.size ({wave.size})")
+        if x.shape != y.shape:
+            raise ValueError(
+                f"x_arcsec {x.shape} and y_arcsec {y.shape} must match")
+        if x.ndim != 1:
+            raise ValueError(f"x_arcsec/y_arcsec must be 1D, got {x.shape}")
+        if x.size != flux.shape[0]:
+            raise ValueError(
+                f"{x.size} fiber positions but {flux.shape[0]} flux rows")
+
     @property
     def fiber_n(self) -> int:
         return int(self.flux.shape[0])
@@ -58,7 +93,8 @@ class FiberSet:
     @property
     def n_wave(self) -> int:
         return int(self.flux.shape[1])
-    
+
+
 def fibers_from_arrays(
     flux: np.ndarray,
     ivar: np.ndarray,
@@ -89,20 +125,8 @@ def fibers_from_arrays(
     x_arcsec = np.asarray(x_arcsec, float)
     y_arcsec = np.asarray(y_arcsec, float)
 
-    if flux.shape != ivar.shape:
-        raise ValueError("flux and ivar must have the same shape")
-    if flux.ndim !=2:
-        raise ValueError("flux must be 2D (fiber_n, wave_n)")
-    if wave.ndim != 1:
-        raise ValueError("wave must be 1D (n_wave,)")
-    if flux.shape[1] != wave.size:
-        raise ValueError("flux.shape[1] must equal wave.size")
-    if x_arcsec.shape != y_arcsec.shape:
-        raise ValueError("x_arcsec and y_arcsec must have same shape")
-    if x_arcsec.ndim != 1:
-        raise ValueError("x_arcsec and y_arcsec must be 1D")
-    if x_arcsec.size != flux.shape[0]:
-        raise ValueError("number of fibres in flux must match x/y")
+    # Shape consistency is enforced by FiberSet.__post_init__, so it applies
+    # to every FiberSet however it was built, not only to this entry point.
 
     if meta is None:
         meta = {}

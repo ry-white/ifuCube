@@ -8,7 +8,7 @@ from high quality DAP emission line maps
 """
 
 from __future__ import annotations
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Sequence
 from pathlib import Path
 import numpy as np 
 from astropy.io import fits
@@ -29,7 +29,11 @@ def ratio_and_ivar(num, num_ivar, den, den_ivar, min_den=0.0):
         var_num = np.where(num_ivar > 0, 1.0/num_ivar, np.nan)
         var_den = np.where(den_ivar > 0, 1.0/den_ivar, np.nan)
     
-        good = np.isfinite(num) & np.isfinite(den) & np.isfinite(var_num)
+        # both variances must be usable, not just the numerator's: otherwise a
+        # ratio is computed but var_R comes out NaN and ivar_R comes out 0,
+        # silently producing a value with zero weight.
+        good = (np.isfinite(num) & np.isfinite(den)
+                & np.isfinite(var_num) & np.isfinite(var_den))
         good &= (np.abs(den) > float(min_den))
 
         R = np.full_like(num, np.nan)
@@ -86,6 +90,7 @@ def save_ratio_map_to_fits(
 
     hdr = wcs2d.to_header(relax=True) if wcs2d is not None else fits.Header()
 
+    hdr["BUNIT"] = ("ratio", "dimensionless: do NOT area-convert")
     ratio_hdu = fits.ImageHDU(R.astype("f4"), header=hdr, name="RATIO")
     ivar_hdu  = fits.ImageHDU(IV.astype("f4"), name="IVAR")
     neff_hdu  = fits.ImageHDU(neff.astype("f4"), name="NEFF")

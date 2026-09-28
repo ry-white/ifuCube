@@ -68,9 +68,8 @@ def _get_wcs_and_shape(template_path: Path, template_hdu: str | int):
     return wcs, shape, hdr
 
 def _pixel_area_sr(wcs: WCS) -> float:
-    #sr = steradians
     """
-    Approximate solid angle per pizel in steradians for a celestial WCS
+    Solid angle per pixel in steradians (sr) for a celestial WCS.
     """
 
     # proj_plane_pixel_area returns deg^2 per pixel for celestial WCS
@@ -154,7 +153,8 @@ def _find_output_wcs_and_shape(
             w = WCS(hdr).celestial
             shape_xy = data.shape[-2:] if data.ndim == 3 else data.shape
 
-            dummy = np.zeros(shape_xy, dtype="f4")
+            # only the shape is read; no need to zero-fill it
+            dummy = np.empty(shape_xy, dtype="f4")
             inputs_for_wcs.append((dummy, w))
 
         # Optional: force pixel scale (arcsec/pix) if requested
@@ -211,7 +211,9 @@ def _coadd_map_with_reproject(
         )
 
     reproject_fn = _get_reproject_function(reproject_mode)
-    combine_fn = combine.lower()
+    # _combine_function maps the name to a real callable, including the
+    # custom 'first'/'last' reducers that reproject does not know by name.
+    combine_fn = _combine_function(combine)
 
     # Normalize inputs into list[(array, wcs)]
     arr_wcs: List[Tuple[np.ndarray, WCS]] = []
@@ -434,8 +436,6 @@ def main():
                 fits.ImageHDU(np.asarray(footprint, float).astype("f4"), header=hdr_wcs, name="FOOTPRINT"),
             ])
             hdul.writeto(outpath, overwrite=True)
-            print(f"[ok] Wrote map mosaic: {outpath}")
-
             print(f"[ok] Wrote map mosaic: {outpath}")
             return
 

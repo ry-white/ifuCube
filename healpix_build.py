@@ -188,12 +188,43 @@ def wcs_fits_to_healpix_table(
     nested: bool = True,
     coord_system_out: str = "icrs",
     extra_header: Optional[dict] = None,
+    to_surface_brightness: bool = True,
 ) -> None:
     """
     Read a WCS-tagged map/mosaic FITS file (as written by save_map_to_fits,
     save_cube_to_fits, or mosaic.py) and write out a partial-sky HEALPix
     FITS table (explicit pixel indexing -- only covered pixels are stored,
     since an IFU footprint covers a tiny fraction of the sky).
+
+    Units: why `to_surface_brightness` defaults to True
+    ---------------------------------------------------
+    The maps this package builds are flux-conserving, so a map pixel value is
+    an *amount of flux per tangent-plane pixel* and is proportional to that
+    pixel's solid angle -- halve the pixel size and every value drops by four
+    while the total stays fixed. This function then combines map pixels with a
+    (weighted) *mean* per HEALPix pixel. Averaging a per-pixel amount without
+    dividing by the pixel area makes the output silently proportional to
+    whatever PIXEL_SIZE_ARCSEC the map happened to be built with: rebuild at
+    2 arcsec instead of 15 and every value in the merged table changes by a
+    factor of ~56, with nothing in the file recording why. Two such tables
+    cannot be compared or merged even though NSIDE/ORDERING/COORDSYS agree.
+
+    So by default the input plane is divided by its pixel solid angle before
+    binning, turning it into a surface brightness (flux per arcsec**2) that
+    does not depend on the map's pixel size. Weights transform with the square
+    of the same factor: dividing a quantity by a constant divides its variance
+    by the square, hence multiplies its inverse variance by the square. The
+    output header records BUNIT accordingly.
+
+    (mosaic.py already does the equivalent for reprojection, as a
+    divide-by-in-area / reproject / multiply-by-out-area sandwich. Here only
+    the first half applies, because the point is to *stay* in a pixel-size
+    independent quantity rather than land back on another grid's pixels.)
+
+    Set to_surface_brightness=False for input that is already intensive --
+    a ratio map, an equivalent width, a velocity field -- where dividing by
+    an area would be wrong. If the input HDU's BUNIT looks dimensionless or
+    ratio-like, the conversion is skipped automatically with a printed note.
 
     If the input HDU is 3D (e.g. a multi-line map or a spectral cube),
     every plane along axis 0 is binned separately and stored as columns
@@ -223,8 +254,40 @@ def wcs_fits_to_healpix_table(
 
     with fits.open(in_fits, memmap=False) as hdul:
         data = np.asarray(hdul[hdu].data, float)
-        wcs2d = WCS(hdul[hdu].header).celestial
+        in_hdr = hdul[hdu].header
+        wcs2d = WCS(in_hdr).celestial
         wdata = np.asarray(hdul[weights_hdu].data, float) if weights_hdu is not None else None
+
+    # --- units: convert flux-per-pixel to surface brightness -------------
+    # See the docstring. Without this the output depends on the map's
+    # PIXEL_SIZE_ARCSEC squared.
+    bunit_in = str(in_hdr.get("BUNIT", "")).strip()
+    bunit_out = bunit_in or "unknown"
+    pix_area = None
+    intensive = bunit_in.lower() in ("", "ratio", "dimensionless", "1",
+                                     "km/s", "angstrom", "arcsec")
+    if to_surface_brightness and intensive and bunit_in:
+        print(f"[note] BUNIT={bunit_in!r} looks intensive; skipping the "
+              f"surface-brightness conversion")
+    elif to_surface_brightness:
+        from astropy.wcs.utils import proj_plane_pixel_area
+        pix_area = float(proj_plane_pixel_area(wcs2d)) * 3600.0 ** 2  # arcsec^2
+        if not np.isfinite(pix_area) or pix_area <= 0:
+            raise ValueError(
+                f"could not determine a sensible pixel area from the WCS of "
+                f"HDU {hdu!r} (got {pix_area}); pass to_surface_brightness=False "
+                "if this input is already intensive"
+            )
+        data = data / pix_area
+        if wdata is not None:
+            # flux -> flux/area divides the variance by area**2, so the
+            # inverse variance is multiplied by area**2.
+            wdata = wdata * (pix_area ** 2)
+        bunit_out = f"{bunit_in or 'flux'}/arcsec**2".replace("/pixel/", "/")
+        if bunit_in == "flux/pixel":
+            bunit_out = "flux/arcsec**2"
+        print(f"[ok] converted to surface brightness: divided by "
+              f"{pix_area:.4f} arcsec^2/pixel -> BUNIT={bunit_out}")
 
     if data.ndim == 2:
         planes = [data]
@@ -263,6 +326,13 @@ def wcs_fits_to_healpix_table(
     primary.header["ORDERING"] = ("NESTED" if nested else "RING", "HEALPix pixel ordering")
     primary.header["COORDSYS"] = (coord_system_out.upper(), "Output sky frame")
     primary.header["INDXSCHM"] = ("EXPLICIT", "Partial-sky: only covered pixels stored")
+    # Record the units convention so a merge can refuse to mix them and a
+    # reader never has to guess what VALUE means.
+    primary.header["BUNIT"] = (bunit_out, "units of the VALUE column(s)")
+    primary.header["SBCONV"] = (bool(pix_area is not None),
+                                "T if divided by input pixel area")
+    if pix_area is not None:
+        primary.header["PIXAR_A2"] = (pix_area, "input map pixel area [arcsec**2]")
     if extra_header:
         for k, v in extra_header.items():
             primary.header[k] = v
@@ -405,6 +475,7 @@ def merge_healpix_tables(
     out_fits.parent.mkdir(parents=True, exist_ok=True)
 
     nside = ordering = coordsys = None
+    bunit = "unknown"
     pix_val_sums: dict = {}
     pix_wsums: dict = {}
     pix_nsamp: dict = {}
@@ -414,8 +485,10 @@ def merge_healpix_tables(
             hdr = hdul[0].header
             tbl = hdul[1].data
 
+            this_bunit = str(hdr.get("BUNIT", "unknown")).strip()
             if nside is None:
                 nside, ordering, coordsys = hdr["NSIDE"], hdr["ORDERING"], hdr["COORDSYS"]
+                bunit = this_bunit
             else:
                 if hdr["NSIDE"] != nside or hdr["ORDERING"] != ordering or hdr["COORDSYS"] != coordsys:
                     raise ValueError(
@@ -423,6 +496,15 @@ def merge_healpix_tables(
                         f"({hdr['NSIDE']}/{hdr['ORDERING']}/{hdr['COORDSYS']} "
                         f"vs {nside}/{ordering}/{coordsys}). "
                         "All input tables must be built with the same nside/ordering/frame."
+                    )
+                # Two tables in different units average to nonsense. In
+                # particular a flux/pixel table and a flux/arcsec**2 table
+                # differ by the (arbitrary) map pixel area.
+                if this_bunit != bunit:
+                    raise ValueError(
+                        f"{path}: BUNIT mismatch ({this_bunit!r} vs {bunit!r}). "
+                        "All input tables must share the same units; rebuild "
+                        "them with the same to_surface_brightness setting."
                     )
 
             pix = tbl["PIXEL"].astype(np.int64)
@@ -458,6 +540,7 @@ def merge_healpix_tables(
     primary.header["COORDSYS"] = (coordsys, "Output sky frame")
     primary.header["INDXSCHM"] = ("EXPLICIT", "Partial-sky: only covered pixels stored")
     primary.header["NMERGE"] = (len(in_fits_list), "Number of input pointings merged")
+    primary.header["BUNIT"] = (bunit, "units of the VALUE column (carried over)")
 
     cols = [
         fits.Column(name="PIXEL", format="K", array=union_pix),
@@ -862,11 +945,9 @@ def download_lvm_files(
     Returns
     -------
     destinations : list of str
-        Local paths of every requested file that is (or, for a dry run,
-        would be) on disk afterwards -- files that were already present
-        locally AND files downloaded in this call, in the input row order.
-        Rows dropped by skip_missing, or that failed to download, are not
-        included.
+        Local file paths for the rows actually queued (existing after a
+        real run; the paths *would* exist after a dry run). Rows dropped
+        by skip_missing are not included.
     """
     if method not in ("rsync", "http"):
         raise ValueError(f"method must be 'rsync' or 'http', got {method!r}")
@@ -901,17 +982,13 @@ def download_lvm_files(
         row_kwargs_list.append(row_kwargs)
         destinations.append(a.full(filetype, **row_kwargs))
 
-    import os as _os
-    all_dest = list(destinations)          # every requested file, in input order
-    already_local: list = []
-
     if skip_existing_local:
+        import os as _os
         kept_kwargs, kept_dest = [], []
         n_already_have = 0
         for kwargs, dest in zip(row_kwargs_list, destinations):
             if _os.path.exists(dest):
                 n_already_have += 1
-                already_local.append(dest)
             else:
                 kept_kwargs.append(kwargs)
                 kept_dest.append(dest)
@@ -951,12 +1028,7 @@ def download_lvm_files(
         for kwargs, dest in zip(row_kwargs_list, destinations):
             print(f"    {kwargs} -> {dest}")
         print("Re-run with dry_run=False to actually download.")
-        keep = set(already_local) | set(destinations)
-        return [d for d in all_dest if d in keep]
-
-    if not row_kwargs_list:
-        print(f"[ok] Nothing to download -- all {len(already_local)} requested file(s) already on disk")
-        return [d for d in all_dest if _os.path.exists(d)]
+        return destinations
 
     if method == "rsync":
         a.remote(username=username, password=password, inquire=(username is None and password is None))
@@ -970,7 +1042,7 @@ def download_lvm_files(
             a.get(filetype, **kwargs)
 
     print(f"[ok] Downloaded {n} file(s) via {method} (filetype={filetype}, release={release})")
-    return [d for d in all_dest if _os.path.exists(d)]
+    return destinations
 
 
 def plot_matched_regions(
