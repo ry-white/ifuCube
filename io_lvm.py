@@ -24,11 +24,22 @@ distortion, whereas a plate scale is an assumption about the instrument.
 An incorrect assumed plate scale (8.6 arcsec/mm) previously made the field
 come out about 13x too small. The plate-scale parameter has been removed
 from these readers entirely rather than left in place unused.
+
+Per-fiber catalog (FIBERCAT)
+----------------------------
+read_dap_multi also returns meta["fibercat"]: a dict of 1D arrays, one entry
+per fiber, in exactly the same order as the FiberSet rows (and therefore as
+the columns of the projection matrix A). It always holds fiberid, ra, dec,
+x_arcsec, y_arcsec and the flux/ivar of each requested line; `extra_cols`
+adds any other DAP columns (exact names or wildcards such as "vel_*").
+save_map_to_fits writes it as a FIBERCAT binary table. Use
+list_dap_columns() to see what a DAP file contains.
 """
 
 from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Sequence
+import fnmatch
 import warnings
 
 import yaml
@@ -103,13 +114,65 @@ def _drop_nonfinite(flux, ivar, ra, dec, fiberid, label="fibers"):
     no light, which shows up as a local flux deficit. Removing it from the
     FiberSet keeps it out of A altogether.
     """
-    finite_any = np.isfinite(flux).any(axis=1) & np.isfinite(ivar).any(axis=1)
-    keep = finite_any & np.isfinite(ra) & np.isfinite(dec)
+    keep = _finite_rows(flux, ivar, ra, dec)
     n_bad = int((~keep).sum())
     if n_bad:
         print(f"[info] dropped {n_bad} of {keep.size} {label} with non-finite "
               f"flux/ivar/position")
     return flux[keep], ivar[keep], ra[keep], dec[keep], fiberid[keep]
+
+
+def _finite_rows(flux, ivar, ra, dec) -> np.ndarray:
+    """Rows kept by _drop_nonfinite (split out so the catalog can follow it)."""
+    finite_any = np.isfinite(flux).any(axis=1) & np.isfinite(ivar).any(axis=1)
+    return finite_any & np.isfinite(ra) & np.isfinite(dec)
+
+
+def list_dap_columns(dap_path: str | Path, pattern: str = "*") -> list[str]:
+    """
+    Column names in a DAP file, optionally filtered by a shell-style pattern.
+
+        list_dap_columns(p)              # everything
+        list_dap_columns(p, "*Halpha*")  # just the Halpha quantities
+    """
+    cols = read_DAP_file(Path(dap_path)).colnames
+    return [c for c in cols if fnmatch.fnmatch(c, pattern)]
+
+
+_CORE_CATALOG_KEYS = ("fiberid", "ra", "dec", "x_arcsec", "y_arcsec")
+
+
+def _catalog_columns(dap_tbl, patterns: Sequence[str], rows: np.ndarray) -> dict:
+    """
+    Pull every DAP column matching any of `patterns` (exact names or
+    shell-style wildcards) for the table rows in `rows` -- the original row
+    index of each fiber kept in the FiberSet, so catalog rows line up with
+    the FiberSet exactly. Masked numeric entries become NaN (floats) or 0
+    (integers); vector-valued columns are skipped with a note.
+    """
+    out = {}
+    names = dap_tbl.colnames
+    for pat in patterns:
+        hits = [c for c in names if fnmatch.fnmatch(c, pat)]
+        if not hits:
+            raise KeyError(
+                f"no DAP column matches {pat!r}; use list_dap_columns() to see "
+                "what this file contains"
+            )
+        for c in hits:
+            if c in out or c in _CORE_CATALOG_KEYS:
+                continue
+            col = dap_tbl[c]
+            if hasattr(col, "filled"):
+                kind = col.dtype.kind
+                col = col.filled(np.nan if kind == "f" else (0 if kind in "iub" else ""))
+            arr = np.asarray(col)
+            if arr.ndim != 1:
+                print(f"[note] FIBERCAT: skipping vector-valued column {c!r} "
+                      f"(shape {arr.shape})")
+                continue
+            out[c] = arr[rows]
+    return out
 
 
 def read_lvm_sframe(
@@ -192,6 +255,7 @@ def read_dap_multi(
     fibermap_yaml: str | Path,
     lines: list[str] | None = None,
     drop_nonfinite: bool = True,
+    extra_cols: Sequence[str] | None = None,
 ) -> FiberSet:
     """
     Read an LVM dap file + fibermap YAML and return FiberSet
@@ -212,6 +276,11 @@ def read_dap_multi(
         on individual fibers routinely, and each bad fiber would otherwise
         NaN every pixel in its kernel support.
 
+    extra_cols : sequence of str, optional
+        Extra per-fiber DAP columns to carry into the catalog, by exact name
+        or shell-style wildcard, e.g. ["vel_*", "disp_Halpha*"]. Check the
+        real names with list_dap_columns() first.
+
     Returns
     -------
     FiberSet
@@ -219,7 +288,8 @@ def read_dap_multi(
         ivar : (K, N_lines)
         wave : (N_lines,)   rest wavelengths, used as plane labels
         x_arcsec, y_arcsec : (K,)
-        meta : dict with ra_deg, dec_deg, fiberid, line_names
+        meta : dict with ra_deg, dec_deg, fiberid, line_names, fibercat
+               (fibercat: dict of (K,) arrays, see the module docstring)
     """
 
     dap_path = Path(dap_path)
@@ -280,6 +350,10 @@ def read_dap_multi(
 
     ok = _good_science_mask(fiberid, fibermap_yaml)
 
+    # original DAP-table row of every fiber we keep; the catalog is pulled
+    # through this one index so it cannot drift out of step with the FiberSet
+    rows = np.nonzero(ok)[0]
+
     flux = flux[ok]
     ivar = ivar[ok]
     ra = ra[ok]
@@ -287,10 +361,19 @@ def read_dap_multi(
     fid = fiberid[ok]
 
     if drop_nonfinite:
+        rows = rows[_finite_rows(flux, ivar, ra, dec)]
         flux, ivar, ra, dec, fid = _drop_nonfinite(
             flux, ivar, ra, dec, fid, label="DAP fibers")
 
     x_arcsec, y_arcsec = radec_to_tangent_arcsec(ra, dec)
+
+    # per-fiber catalog, same row order as flux/ivar
+    fibercat = dict(fiberid=fid, ra=ra, dec=dec, x_arcsec=x_arcsec, y_arcsec=y_arcsec)
+    for i, ln in enumerate(line_names):
+        fibercat[f"flux_{ln}"] = flux[:, i]
+        fibercat[f"ivar_{ln}"] = ivar[:, i]
+    if extra_cols:
+        fibercat.update(_catalog_columns(dap_tbl, extra_cols, rows))
 
     return FiberSet(
         flux=flux,      # (K_good, N_lines)
@@ -302,7 +385,8 @@ def read_dap_multi(
             ra_deg=ra,
             dec_deg=dec,
             fiberid=fid,
-            line_names=line_names,),
+            line_names=line_names,
+            fibercat=fibercat,),
     )
 
 
@@ -310,6 +394,7 @@ def read_dap(
     dap_path: str | Path,
     fibermap_yaml: str | Path,
     drop_nonfinite: bool = True,
+    extra_cols: Sequence[str] | None = None,
 ) -> FiberSet:
     """
     Single-line (Halpha) DAP reader.
@@ -326,4 +411,5 @@ def read_dap(
         fibermap_yaml=fibermap_yaml,
         lines=["Halpha"],
         drop_nonfinite=drop_nonfinite,
+        extra_cols=extra_cols,
     )

@@ -15,11 +15,11 @@ Examples:
 
     # Build DAP maps
     python -m ifuCube.build dap-maps \
-        --dap dap-rsp108-sn20-00004297.dap.fits.gz \
+        --dap dap/dap-rsp108-sn20-00006112.dap.fits.gz \
         --fibermap /home/rwhite/lvmcore/metrology/lvm_fiducial_fibermap.yaml \
         --out lvmDAPMaps-00004297.fits \
-        --lines Halpha [NII]6583 [SII]6716 [SII]6731 [0III]5007 \
-        --pix 2.0 --fwhm 35 --frad 18.5 --rsigma 3 --kernel gauss
+        --lines Halpha [NII]6583 [SII]6716 [SII]6731 \
+        --pix 2.0 --fwhm 3.2 --frad 18.5 --rsigma 3 --kernel gauss
 
     python -m ifuCube.build dap-maps \
         --dap ~/sas/sdsswork/lvm/spectro/analysis/1.2.1/0011XX/11111/60222/00006117/dap-rsp108-sn20-00006117.dap.fits.gz \
@@ -74,6 +74,7 @@ def cmd_dap_maps(args: argparse.Namespace) -> None:
         dap_path=dap_path,
         fibermap_yaml=fibermap_yaml,
         lines=args.lines,
+        extra_cols=args.extra_cols,
     )
 
     result = build_map(
@@ -166,6 +167,8 @@ def main() -> None:
 
     p_map.add_argument("--lines", nargs="+", default=["Halpha"],
                        help=f"Logical line names; choose from {sorted(LINE_DEFS)}")
+    p_map.add_argument("--extra-cols", nargs="+", default=None,
+                       help='Extra DAP columns for the FIBERCAT table, names or wildcards, e.g. "vel_*"')
     p_map.add_argument("--pix", type=float, default=2.0, help="Spaxel size in arcsec")
     p_map.add_argument("--fwhm", type=float, default=3.2, help="Gaussian kernel FWHM in arcsec (set from fiber spacing ~35, not from --pix)")
     p_map.add_argument("--frad", type=float, default=18.5, help="Fibre radius in arcsec")

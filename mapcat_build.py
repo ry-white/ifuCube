@@ -12,18 +12,42 @@ Wires together:
     - geometry.fit_celestial_wcs
     - kernels.build_projection_A / splat_cube / ivar_through_A / neff_from_A
 
-Units of the output
--------------------
-The projection is flux-conserving (columns of A sum to 1), so a pixel value
-is an *amount of flux per output pixel*, and is therefore proportional to the
-pixel solid angle. save_map_to_fits records this in the FLUX header as
+Units of the output -- read this before comparing map values
+-------------------------------------------------------------
+The FLUX image is stored as *flux per pixel* (BUNIT = 'flux/pixel').
 
-    BUNIT    = 'flux/pixel'
-    PIXAR_A2 = <pixel solid angle in arcsec**2>
+Why: the projection is flux-conserving. Each fiber's measured flux is shared
+out over nearby pixels with weights that sum to 1, so summing the pixels of
+a region gives the total flux in that region, exactly -- the natural unit
+for photometry. The price is that a pixel value depends on how big the
+pixel is: build the same data with 5" instead of 15" pixels and each value
+drops 9x (the light is split over 9x as many pixels), while totals stay the
+same.
 
-so that anything downstream which averages pixels (HEALPix binning,
-reprojection to a different grid) can divide by PIXAR_A2 first and work in
-surface brightness instead. See the kernels.py module docstring.
+To compare maps built with different pixel sizes, or to average pixels
+(which the HEALPix step does), divide by the pixel solid angle first. That
+gives a surface brightness, flux per arcsec**2, which does not depend on the
+pixel size:
+
+    surface_brightness = FLUX / PIXAR_A2          [flux / arcsec**2]
+    ivar_sb            = IVAR * PIXAR_A2**2       (variance scales with the square)
+
+PIXAR_A2 is written in the FLUX header. read_map() below does this for you,
+and wcs_fits_to_healpix_table does it by default.
+
+A second, constant factor: fiber fill factor
+--------------------------------------------
+DAP fluxes are totals per fiber aperture (35.3" diameter), but LVM fibers
+sit on a 37" hexagonal grid, so apertures cover only
+
+    APERFILL = pi * (35.3/2)**2 / ((sqrt(3)/2) * 37**2) = 0.8255
+
+of the sky; light falling between fibers is never measured. The map spreads
+each fiber's flux over its whole grid cell, so on smooth emission the
+surface brightness above reads ~0.83x the true sky value. That is the same
+for every pixel size and kernel, so it does not affect comparisons between
+LVM maps, but divide by APERFILL (read_map(..., correct_fill_factor=True))
+when comparing against other surveys or a model in absolute units.
 """
 
 from __future__ import annotations
@@ -38,6 +62,12 @@ from .geometry import (make_grid_from_points, fit_celestial_wcs, make_wcs3d,
                        pixel_area_arcsec2)
 from .kernels import (build_projection_A, splat_cube, ivar_through_A,
                       neff_from_A, coverage_from_A)
+
+# LVM science IFU geometry (Drory et al. 2024): 35.3" apertures on a 37" hex grid
+LVM_FIBER_DIAMETER_ARCSEC = 35.3
+LVM_FIBER_PITCH_ARCSEC = 37.0
+LVM_FILL_FACTOR = (np.pi * (LVM_FIBER_DIAMETER_ARCSEC / 2) ** 2
+                   / (np.sqrt(3) / 2 * LVM_FIBER_PITCH_ARCSEC ** 2))   # 0.8255
 
 def build_map(
     fibers: FiberSet,
@@ -97,6 +127,8 @@ def build_map(
         "wave" : wavelength array
         "line_names" : list[str] if present in fibers.meta
         "pixel_size_arcsec" : echoed back, so save_map_to_fits can record it
+        "fibercat" : per-fiber catalog from the reader (dict of (K,) arrays)
+                     or None; written by save_map_to_fits as FIBERCAT
     """
 
     # Scrub non-finite input. This matters more than it looks: the projection
@@ -189,6 +221,7 @@ def build_map(
         line_names=line_names,
         pixel_size_arcsec=float(pixel_size_arcsec),
         flux_in=flux,
+        fibercat=fibers.meta.get("fibercat"),
     )
 
 def save_map_to_fits(
@@ -207,13 +240,16 @@ def save_map_to_fits(
     HDU 3 : NEFF  (ny, nx)
     HDU 4 : LINES (BinTable: LINE_NAME, WAVE)
     HDU 5 : COVERAGE (ny, nx)   -- summed kernel weight, if present
+    HDU 6 : FIBERCAT (BinTable) -- one row per fiber used, if present
 
     WCS (if present) is written to the FLUX, IVAR, NEFF and COVERAGE headers
     (they all share the same grid) and applies to the last two axes; the first
     axis of FLUX/IVAR is "line index".
 
     BUNIT / PIXAR_A2 are written so that downstream code knows these values
-    are flux *per pixel* and can convert to surface brightness.
+    are flux *per pixel* and can convert to surface brightness; the FLUX
+    header also carries COMMENT cards spelling out the conversion. See the
+    module docstring, and read_map() for a reader that applies it.
     """
 
     from pathlib import Path as _P
@@ -260,6 +296,19 @@ def save_map_to_fits(
     if pix_area is not None:
         map_hdr["PIXAR_A2"] = (pix_area, "pixel solid angle [arcsec**2]")
     map_hdr["FLUXCONS"] = (True, "columns of projection matrix A sum to 1")
+    map_hdr["APERFILL"] = (round(float(LVM_FILL_FACTOR), 4),
+                           "LVM fiber aperture fill factor, see COMMENT")
+    for line in (
+        "FLUX is flux PER PIXEL (flux-conserving: summing pixels gives the",
+        "total flux). Values scale with pixel area, so to compare maps with",
+        "different pixel sizes, or to average pixels, convert first:",
+        "  surface brightness [flux/arcsec**2] = FLUX / PIXAR_A2",
+        "  its inverse variance                = IVAR * PIXAR_A2**2",
+        "Fibers cover APERFILL of the sky (35.3in apertures, 37in hex grid);",
+        "divide surface brightness by APERFILL for true sky brightness.",
+        "ifuCube.mapcat_build.read_map() applies both conversions.",
+    ):
+        map_hdr.add_comment(line)
 
     ivar_hdr = map_hdr.copy()
     ivar_hdr["BUNIT"] = ("1/(flux/pixel)**2", "inverse variance of FLUX")
@@ -287,4 +336,89 @@ def save_map_to_fits(
         hdus.append(fits.ImageHDU(np.asarray(coverage, float).astype("f4"),
                                   header=aux_hdr, name="COVERAGE"))
 
+    # Per-fiber catalog: one row per fiber that went into this map, in the
+    # same order as the columns of A. Missing numeric values are stored as NaN.
+    fibercat = result.get("fibercat")
+    if fibercat:
+        from astropy.table import Table
+        cat_hdu = fits.table_to_hdu(Table(fibercat))
+        cat_hdu.name = "FIBERCAT"
+        cat_hdu.header["COMMENT"] = ("One row per fiber used to build FLUX; "
+                                     "flux_* are per-fiber aperture totals.")
+        hdus.append(cat_hdu)
+
     fits.HDUList(hdus).writeto(path, overwrite=True)
+
+
+def read_map(
+    path: str,
+    units: str = "surface_brightness",
+    correct_fill_factor: bool = False,
+    hdu: str = "FLUX",
+) -> Dict[str, Any]:
+    """
+    Read a map written by save_map_to_fits, converting units on the way in.
+
+    Parameters
+    ----------
+    path : str
+        Map FITS file.
+    units : {"surface_brightness", "flux_per_pixel"}
+        "surface_brightness" (default): FLUX / PIXAR_A2, in flux/arcsec**2.
+        Independent of the pixel size the map was built with, so maps built
+        with different settings can be compared pixel by pixel.
+        "flux_per_pixel": the stored values; sum pixels for total flux.
+    correct_fill_factor : bool
+        Also divide by APERFILL (~0.83), so smooth emission matches the true
+        sky surface brightness. Only valid with units="surface_brightness".
+    hdu : str
+        Image HDU to read (default "FLUX").
+
+    Returns
+    -------
+    dict with
+        "data"     : (N_lines, ny, nx) or (ny, nx) array in the chosen units
+        "ivar"     : matching inverse variance
+        "wcs"      : celestial WCS
+        "bunit"    : units string of "data"
+        "header"   : header of the image HDU
+        "fibercat" : astropy Table of the FIBERCAT extension, or None
+
+    Example
+    -------
+        m = read_map("map_exp00006116.fits")
+        plt.subplot(projection=m["wcs"]); plt.imshow(m["data"][0], origin="lower")
+    """
+    from astropy.table import Table
+
+    with fits.open(path) as hdul:
+        hdr = hdul[hdu].header.copy()
+        data = np.asarray(hdul[hdu].data, float)
+        ivar = np.asarray(hdul["IVAR"].data, float) if "IVAR" in hdul else None
+        cat = Table.read(hdul["FIBERCAT"]) if "FIBERCAT" in hdul else None
+    wcs2d = WCS(hdr).celestial
+    if data.ndim == 3 and data.shape[0] == 1:
+        data = data[0]
+        ivar = ivar[0] if ivar is not None else None
+
+    bunit = str(hdr.get("BUNIT", "flux/pixel"))
+    if units == "surface_brightness":
+        if bunit != "flux/pixel":
+            raise ValueError(f"{hdu} has BUNIT={bunit!r}, not 'flux/pixel'; "
+                             "use units='flux_per_pixel' to read it as stored")
+        area = float(hdr.get("PIXAR_A2", pixel_area_arcsec2(wcs2d)))
+        data = data / area
+        ivar = ivar * area ** 2 if ivar is not None else None
+        bunit = "flux/arcsec**2"
+        if correct_fill_factor:
+            fill = float(hdr.get("APERFILL", LVM_FILL_FACTOR))
+            data = data / fill
+            ivar = ivar * fill ** 2 if ivar is not None else None
+            bunit += " (aperture-fill corrected)"
+    elif units == "flux_per_pixel":
+        if correct_fill_factor:
+            raise ValueError("correct_fill_factor needs units='surface_brightness'")
+    else:
+        raise ValueError(f"units must be 'surface_brightness' or 'flux_per_pixel', got {units!r}")
+
+    return dict(data=data, ivar=ivar, wcs=wcs2d, bunit=bunit, header=hdr, fibercat=cat)
