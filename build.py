@@ -30,10 +30,10 @@ Examples:
     
     # Build cube from SFrame
     python -m ifuCube.build cube \
-        --sframe sframe/lvmSFrame-00003299.fits \
+        --sframe /home/rwhite/sas/sdsswork/lvm/spectro/redux/1.3.2/0011XX/11111/60191/lvmSFrame-00004297.fits \
         --fibermap /home/rwhite/lvmcore/metrology/lvm_fiducial_fibermap.yaml \
-        --out lvmCubeClean-00003299.fits \
-        --pix 2.0 --fwhm 3.2 --frad 18.5 --rsigma 3 --kernel gauss
+        --out lvmCubeClean-00004297.fits \
+        --pix 15.0 --fwhm 35 --frad 18.5 --rsigma 3 --kernel gauss
 
     # Build ratio map from a multi-line MAP FITS (output of dap-maps)
     python build.py ratio \
@@ -66,7 +66,7 @@ def _ensure_parent(path:Path) -> None:
 
 def cmd_dap_maps(args: argparse.Namespace) -> None:
     dap_path = Path(args.dap)
-    fibermap_yaml = Path(args.fibermap)
+    fibermap_yaml = Path(args.fibermap) if args.fibermap else None
     out_path = Path(args.out)
     _ensure_parent(out_path)
 
@@ -75,6 +75,11 @@ def cmd_dap_maps(args: argparse.Namespace) -> None:
         fibermap_yaml=fibermap_yaml,
         lines=args.lines,
         extra_cols=args.extra_cols,
+        kinematics=not args.no_kinematics,
+        slitmap_path=args.slitmap,
+        mask_source=args.mask_source,
+        assume_all_science={"auto": "auto", "yes": True,
+                            "no": False}[args.assume_all_science],
     )
 
     result = build_map(
@@ -122,13 +127,14 @@ def cmd_ratio(args) -> None:
 
 def cmd_cube(args: argparse.Namespace) -> None:
     sframe_path = Path(args.sframe)
-    fibermap_yaml = Path(args.fibermap)
+    fibermap_yaml = Path(args.fibermap) if args.fibermap else None
     out_path = Path(args.out)
     _ensure_parent(out_path)
 
     fibers = read_lvm_sframe(
         sframe_path=sframe_path,
         fibermap_yaml=fibermap_yaml,
+        mask_source=args.mask_source,
     )
 
     result = build_cube(
@@ -162,13 +168,36 @@ def main() -> None:
     # ---- dap-maps ----
     p_map = sub.add_parser("dap-maps", help="Build multi-line DAP emission maps")
     p_map.add_argument("--dap", required=True, help="DAP file path")
-    p_map.add_argument("--fibermap", required=True, help="fibermap YAML path")
+    p_map.add_argument("--fibermap", default=None,
+                       help="fiducial fibermap YAML. OPTIONAL and a last resort: "
+                            "targettype/fibstatus are preferred from the DAP table "
+                            "or --slitmap, which describe this exposure")
+    p_map.add_argument("--slitmap", default=None,
+                       help="FITS file with a SLITMAP extension (normally the sframe "
+                            "this DAP file came from); used if the DAP table itself "
+                            "has no targettype/fibstatus")
+    p_map.add_argument("--assume-all-science", dest="assume_all_science",
+                       choices=["auto", "yes", "no"], default="auto",
+                       help="what to do when no source has targettype (e.g. a DAP PT "
+                            "table). 'auto' (default) decides from the row count: a "
+                            "table larger than the science-fibre complement must still "
+                            "hold sky fibres and is refused. 'yes' forces, 'no' always "
+                            "raises")
+    p_map.add_argument("--mask-source", dest="mask_source", default="auto",
+                       choices=["auto", "table", "slitmap", "yaml"],
+                       help="pin the mask to one source instead of the auto chain")
     p_map.add_argument("--out", required=True, help="Output FITS map filename")
 
     p_map.add_argument("--lines", nargs="+", default=["Halpha"],
                        help=f"Logical line names; choose from {sorted(LINE_DEFS)}")
     p_map.add_argument("--extra-cols", nargs="+", default=None,
-                       help='Extra DAP columns for the FIBERCAT table, names or wildcards, e.g. "vel_*"')
+                       help='Extra DAP columns for the FIBERCAT table, names or wildcards, e.g. "vel_*". '
+                            'For non-per-line quantities; each requested line already brings its own kinematics.')
+    p_map.add_argument("--no-kinematics", action="store_true",
+                       help="Do not add each line's velocity/dispersion (and errors) to FIBERCAT. "
+                            "By default they are derived from the line's flux column stem "
+                            "(flux_Halpha_6562.85 -> vel_Halpha_6562.85, ...) and any that the "
+                            "DAP file does not have are reported and skipped.")
     p_map.add_argument("--pix", type=float, default=2.0, help="Spaxel size in arcsec")
     p_map.add_argument("--fwhm", type=float, default=3.2, help="Gaussian kernel FWHM in arcsec (set from fiber spacing ~35, not from --pix)")
     p_map.add_argument("--frad", type=float, default=18.5, help="Fibre radius in arcsec")
@@ -180,7 +209,13 @@ def main() -> None:
     # ---- cube ----
     p_cube = sub.add_parser("cube", help="Build a cube from an LVM SFrame")
     p_cube.add_argument("--sframe", required=True, help="SFrame FITS path")
-    p_cube.add_argument("--fibermap", required=True, help="fibermap YAML path")
+    p_cube.add_argument("--fibermap", default=None,
+                        help="fiducial fibermap YAML. OPTIONAL: the sframe's own "
+                             "SLITMAP normally carries targettype/fibstatus and is "
+                             "preferred, since it describes this exposure")
+    p_cube.add_argument("--mask-source", dest="mask_source", default="auto",
+                        choices=["auto", "table", "yaml"],
+                        help="pin the mask to one source ('table' = the SLITMAP)")
     p_cube.add_argument("--out", required=True, help="Output FITS cube filename")
 
     p_cube.add_argument("--pix", type=float, default=2.0, help="Spaxel size in arcsec")

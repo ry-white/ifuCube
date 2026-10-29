@@ -54,6 +54,7 @@ from __future__ import annotations
 from typing import Optional, Dict, Any, Sequence
 
 import numpy as np
+from pathlib import Path as _Path
 from astropy.io import fits
 from astropy.wcs import WCS
 
@@ -120,7 +121,15 @@ def build_map(
         "neff" : (ny, nx) effective number of fibers per pixel
         "coverage" : (ny, nx) summed kernel weight per pixel (row sums of A);
                      divide "map" by this to get a weighted average instead
-                     of a flux-conserving sum
+                     of a flux-conserving sum. NOT a fraction: it sums to K
+                     over the whole grid, so it sits near K/N_inside (~0.19
+                     for 15" LVM pixels), and its maximum moves with the
+                     kernel width. Do not threshold on it directly.
+        "coverage_norm" : (ny, nx) coverage / cov_plateau -- 1.0 on the
+                     well-sampled interior, 0 outside, for any kernel width
+                     and pixel size. THIS is the one to threshold on.
+        "cov_plateau" : float, K / N_inside; the exact mean of coverage over
+                     the footprint, used as the normalisation above
         "A"    : (P, K) projection matrix
         "xg", "yg", "inside" : grid and IFU mask
         "wcs2d" : WCS or None
@@ -175,8 +184,34 @@ def build_map(
     ivar_cube = ivar_through_A(ivar, A, ny=ny, nx=nx)
 
     # effective number of fibers per pixel, and raw coverage
+    #
+    # NOTE ON THE SCALE OF `coverage`. It is the row sum of A, and the columns
+    # of A sum to 1, so
+    #
+    #     sum_p coverage(p) = sum_p sum_k A[p,k] = sum_k 1 = K
+    #
+    # exactly, whatever the kernel width or pixel size. That makes the mean of
+    # coverage over the covered footprint exactly K / N_inside -- typically
+    # ~0.19 for 15" pixels on the LVM grid, NOT ~1. A threshold like
+    # `coverage > 0.3` therefore masks everything, and the number at which it
+    # would start to bite moves with both FWHM and pixel size. It is not a
+    # fraction of anything and has no fixed ceiling: a narrow kernel piles
+    # weight into few pixels and pushes the maximum well above the mean (0.51
+    # at FWHM 20", 0.22 at FWHM 60", measured).
+    #
+    # `coverage_norm` below divides by that exact mean, so it is 1.0 on the
+    # well-sampled interior and falls to 0 at the edge, for ANY kernel width
+    # and pixel size. Threshold on that, or on `neff`, never on raw coverage.
     neff = neff_from_A(A, ny=ny, nx=nx)
     coverage = coverage_from_A(A, ny=ny, nx=nx)
+
+    # Exact plateau value: sum_p coverage(p) == K, so the mean over the
+    # footprint is K / N_inside. Derived from the data, not from the fibre
+    # aperture or the grid spacing, so it stays correct for any bundle.
+    n_inside = int(np.count_nonzero(inside))
+    cov_plateau = (float(flux.shape[0]) / n_inside) if n_inside else float("nan")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        coverage_norm = coverage / cov_plateau if n_inside else np.zeros_like(coverage)
 
     # L=1 for a single emission line
     if map_cube.shape[0] == 1:
@@ -212,6 +247,8 @@ def build_map(
         ivar=eivar,
         neff=neff,
         coverage=coverage,
+        coverage_norm=coverage_norm,
+        cov_plateau=cov_plateau,
         A=A,
         xg=xg,
         yg=yg,
@@ -222,7 +259,40 @@ def build_map(
         pixel_size_arcsec=float(pixel_size_arcsec),
         flux_in=flux,
         fibercat=fibers.meta.get("fibercat"),
+        fibermask=fibers.meta.get("fibermask"),
+        mask_info=fibers.meta.get("mask_info"),
     )
+
+def build_kinematic_map(
+    result: Dict[str, Any],
+    quantity: str = "vel",  # can be dispersion too of course
+    lines: Optional[Sequence[str]] = None,
+    weighting: str = "ivar",
+    min_weight_frac: float = 0.05, 
+    err_prefx: str = "e_",
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Build a kinematic map using the result of build_mapcat
+
+    Parameters
+    ----------
+    result : Dict
+        output from build_mapcat containing A, coverage, fibercat
+    quantity : str 
+        quantity that is used to build the kinematic map (vel, disp)
+    lines : (Optional) Sequence
+        if a result is passed with multiple lines, you can pick which lines you
+        want a map to made with
+    weighting : str 
+        uses "ivar" weighting by default since errors/ivar should be found in ivar
+        but options include equal,
+    min_weight_frac : float
+        default = 0.05,
+
+
+    """
+
 
 def save_map_to_fits(
     result: Dict[str, Any],
@@ -240,7 +310,9 @@ def save_map_to_fits(
     HDU 3 : NEFF  (ny, nx)
     HDU 4 : LINES (BinTable: LINE_NAME, WAVE)
     HDU 5 : COVERAGE (ny, nx)   -- summed kernel weight, if present
-    HDU 6 : FIBERCAT (BinTable) -- one row per fiber used, if present
+    HDU 6 : FIBERMASK (BinTable) -- EVERY fiber in the input, with
+            targettype, fibstatus and keep; the audit trail for the mask
+    HDU 7 : FIBERCAT (BinTable) -- one row per fiber USED, if present
 
     WCS (if present) is written to the FLUX, IVAR, NEFF and COVERAGE headers
     (they all share the same grid) and applies to the last two axes; the first
@@ -338,6 +410,46 @@ def save_map_to_fits(
 
     # Per-fiber catalog: one row per fiber that went into this map, in the
     # same order as the columns of A. Missing numeric values are stored as NaN.
+    # Mask provenance: which source said which fibers were usable. Recorded
+    # in the header so a map can be traced back to its mask without the
+    # external file that may have supplied it.
+    mi = result.get("mask_info") or {}
+    if mi:
+        mh = map_hdu.header          # the live header; map_hdr was copied
+        mh["MASKSRC"] = (str(mi.get("source", "unknown"))[:60],
+                         "source of targettype/fibstatus")
+        mh["MASKFSRC"] = (str(mi.get("fibstatus_source", "unknown"))[:60],
+                          "source of fibstatus specifically")
+        mh["MASKEXT"] = (str(mi.get("extname") or "")[:60],
+                         "FITS extension the mask came from")
+        mh["MASKTCOL"] = (str(mi.get("targettype_col", ""))[:60],
+                          "targettype column used")
+        mh["MASKSCOL"] = (str(mi.get("fibstatus_col") or "")[:60],
+                          "health flag column used")
+        mh["MASKKIND"] = (str(mi.get("health_kind", ""))[:60],
+                          "fibstatus | quality | none")
+        mh["NFIBTOT"] = (int(mi.get("n_total", 0)), "fibers in input file")
+        mh["NFIBUSED"] = (int(mi.get("n_keep", 0)), "fibers used in FLUX")
+        mh["NNOTSCI"] = (int(mi.get("n_not_science", 0)), "rejected: not science")
+        mh["NBADSTAT"] = (int(mi.get("n_bad_status", 0)), "rejected: fibstatus")
+
+    cov_plateau = result.get("cov_plateau")
+    if cov_plateau is not None and np.isfinite(cov_plateau):
+        map_hdu.header["COVPLATE"] = (float(cov_plateau),
+                                      "mean coverage over footprint = K/N_inside")
+        map_hdu.header["COVNOTE"] = ("COVERAGE/COVPLATE ~ 1 on the interior",
+                                     "threshold on that, not on COVERAGE")
+
+    fibermask = result.get("fibermask")
+    if fibermask:
+        from astropy.table import Table as _T
+        mask_hdu = fits.table_to_hdu(_T(fibermask))
+        mask_hdu.name = "FIBERMASK"
+        mask_hdu.header["COMMENT"] = ("Every fiber in the input file, kept or "
+                                      "not. keep=F fibers are absent from "
+                                      "FLUX and FIBERCAT.")
+        hdus.append(mask_hdu)
+
     fibercat = result.get("fibercat")
     if fibercat:
         from astropy.table import Table
@@ -347,7 +459,31 @@ def save_map_to_fits(
                                      "flux_* are per-fiber aperture totals.")
         hdus.append(cat_hdu)
 
+    # Create the parent directory rather than failing after all the work is
+    # done. ratio.py has always done this; the inconsistency meant a typo in a
+    # notebook config cell surfaced as a FileNotFoundError from inside astropy,
+    # several hundred lines from the line that caused it.
+    _parent = _Path(path).parent
+    if str(_parent) not in ("", "."):
+        _parent.mkdir(parents=True, exist_ok=True)
+
     fits.HDUList(hdus).writeto(path, overwrite=True)
+
+
+def _plane_index(name: str, names) -> int:
+    """
+    Plane number of a line, by name, case-insensitively.
+
+    Exists so nobody has to write names.index(...) and get a bare ValueError
+    when the spelling is off; this says what IS in the file.
+    """
+    want = str(name).strip()
+    if want in names:
+        return names.index(want)
+    low = [n.lower() for n in names]
+    if want.lower() in low:
+        return low.index(want.lower())
+    raise KeyError(f"line {name!r} is not in this map. Available: {names}")
 
 
 def read_map(
@@ -373,6 +509,12 @@ def read_map(
         sky surface brightness. Only valid with units="surface_brightness".
     hdu : str
         Image HDU to read (default "FLUX").
+
+    Returns
+    -------
+    dict with data, ivar, wcs, bunit, header, fibercat, line_names, wave and
+    index. `index` is a callable -- m["index"]("Halpha") gives the plane
+    number -- so nothing downstream has to index FLUX by position.
 
     Returns
     -------
@@ -421,4 +563,21 @@ def read_map(
     else:
         raise ValueError(f"units must be 'surface_brightness' or 'flux_per_pixel', got {units!r}")
 
-    return dict(data=data, ivar=ivar, wcs=wcs2d, bunit=bunit, header=hdr, fibercat=cat)
+    # Which plane is which. Without this the caller holds an (N, ny, nx) cube
+    # and no way to index it except by position -- and reordering --lines once
+    # then hands them an Halpha map labelled Hbeta, which looks entirely
+    # plausible. Empty list if the file has no LINES table.
+    line_names, waves = [], []
+    try:
+        with fits.open(path, memmap=False) as _h:
+            if "LINES" in _h:
+                _l = _h["LINES"].data
+                line_names = [str(x).strip() for x in _l["LINE_NAME"]]
+                waves = np.asarray(_l["WAVE"], float)
+    except (OSError, KeyError):
+        pass
+
+    return dict(data=data, ivar=ivar, wcs=wcs2d, bunit=bunit, header=hdr,
+                fibercat=cat, line_names=line_names,
+                wave=np.asarray(waves, float),
+                index=lambda name, _n=line_names: _plane_index(name, _n))

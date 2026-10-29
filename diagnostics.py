@@ -20,6 +20,11 @@ out at whatever sum_p w_pk^2 happens to be (~0.19 for a typical LVM kernel).
 The quantity that should be 1 is the partition-of-unity redistribution:
 share each pixel's flux back among the fibers in proportion to their weight
 in that pixel. `partition_of_unity_band_ratio` does that;
+`partition_of_unity_band_ratio` is a neighbourhood average, not a
+conservation test: it is exactly 1 only for a spatially constant flux field,
+and on a structured source its spread measures the SOURCE's contrast. The
+unconditional flux checks are `global_flux_ratio` and `column_sum_check`.
+
 `per_fibre_residuals` is the raw adjoint comparison and is only meaningful
 relative to itself (e.g. spotting outlier fibers).
 
@@ -87,13 +92,17 @@ def global_flux_ratio_from_A(
     ratio : float
         sum(cube) / sum(flux_fib)
     """
+    A = _as_projection_matrix(A, "global_flux_ratio_from_A")
     flux0 = np.nan_to_num(flux_fib, nan=0.0, posinf=0.0, neginf=0.0)
     cube0 = np.nan_to_num(cube_flux, nan=0.0, posinf=0.0, neginf=0.0)
 
     K, L = flux0.shape
     P, K_A = A.shape
     if K_A != K:
-        raise ValueError("A.shape[1] must match number of fibres in flux_fib")
+        raise ValueError(
+            f"A has {K_A} columns but flux_fib has {K} fibers. A must be the "
+            f"projection matrix from the same build (result['A'])."
+        )
 
     # recompute cube from A for safety
     C_from_A = (A @ flux0).astype(float)        # (P, L)
@@ -145,6 +154,7 @@ def adjoint_dot_product_test(
     worst : float
         Largest relative mismatch over the trials.
     """
+    A = _as_projection_matrix(A, "adjoint_dot_product_test")
     rng = np.random.default_rng(rng_seed)
     P, K = A.shape
     if K != fiber_n:
@@ -168,6 +178,40 @@ def adjoint_dot_product_test(
             print(f"[Adjoint Test {t+1}/{trials_n}] relative mismatch = {rel:.3e}")
     return worst
 
+def _as_projection_matrix(A, where: str = "this check"):
+    """
+    Refuse anything that is not a projection matrix, loudly.
+
+    Every function here takes an argument called `A`, and `A` is a tempting
+    name for a least-squares design matrix too. Handing one of those to
+    column_sum_check does NOT raise -- it sums the columns of a (K, 3) design
+    matrix and returns a dict full of plausible-looking nonsense. A silent
+    wrong answer from a validation routine is worse than no validation, so
+    the shape is checked here instead of trusted.
+
+    A real projection matrix from build_map/build_cube is sparse, 2-D, and
+    has many more rows (pixels) than columns (fibers).
+    """
+    if not sparse.issparse(A):
+        raise TypeError(
+            f"{where}: A must be the sparse projection matrix from "
+            f"build_map/build_cube (result['A']), got "
+            f"{type(A).__name__} with shape {getattr(A, 'shape', '?')}.\n"
+            f"If you reused the name `A` for a design matrix or an array, "
+            f"restore it with  A = res['A']."
+        )
+    if A.ndim != 2:
+        raise ValueError(f"{where}: A must be 2-D, got ndim={A.ndim}")
+    P, K = A.shape
+    if P < K:
+        raise ValueError(
+            f"{where}: A has shape {A.shape}, i.e. fewer pixels ({P}) than "
+            f"fibers ({K}). That is almost certainly a transposed or wrong "
+            f"matrix; the projection matrix is (n_pixels, n_fibers)."
+        )
+    return A
+
+
 def column_sum_check(A: sparse.csr_matrix, atol: float = 1e-12) -> Dict[str, Any]:
     """
     Verify the flux-conservation property directly on the operator.
@@ -183,6 +227,7 @@ def column_sum_check(A: sparse.csr_matrix, atol: float = 1e-12) -> Dict[str, Any
     -------
     dict with keys n_fibers, n_dropped, min_nonzero, max, all_unit
     """
+    A = _as_projection_matrix(A, "column_sum_check")
     col = np.asarray(A.sum(axis=0)).ravel()
     nonzero = col[col > 0]
     return dict(
@@ -205,8 +250,36 @@ def partition_of_unity_band_ratio(
 
     Redistributes each pixel's band-integrated flux back to the fibers in
     proportion to their share of that pixel, and compares against the
-    original per-fiber band flux. A per-fiber version of the global flux
-    ratio: it localises *which* fibers lost flux.
+    original per-fiber band flux.
+
+    WHAT THIS ACTUALLY MEASURES -- read before using it as a pass/fail test.
+    Substituting the forward model Cb(p) = sum_j A[p,j] Fb_j into the
+    redistribution gives
+
+        Fb_hat(k) = sum_j M[k,j] Fb_j ,
+        M[k,j]    = sum_p A[p,k] A[p,j] / W(p) ,   sum_j M[k,j] = 1
+
+    so Fb_hat(k) is a WEIGHTED AVERAGE of fiber k and its kernel neighbours,
+    with weights that sum to one. It equals Fb_k exactly only where the flux
+    field is locally constant. On a structured source the ratio departs from
+    1 by an amount set by the source's own contrast, not by any fault in the
+    projection. Measured on one hex bundle, same A, varying only the field:
+
+        constant          median 1.0000   5-95% spread 0.0000
+        smooth gradient   median 1.0000                0.0050
+        broad gaussian    median 0.9990                0.0833
+        ring              median 1.0088                0.2913
+
+    with the total flux ratio exactly 1.000000000000 in all four. The median
+    is biased slightly high for the same reason: a faint fiber beside bright
+    neighbours is pulled up by a large FRACTION, while a bright fiber beside
+    faint ones is pulled down by a smaller one, so the ratio distribution is
+    skewed.
+
+    Use it to localise which fibers sit on steep gradients, and to spot a
+    single fiber whose ratio is wild compared with its neighbours. Do NOT use
+    it as a flux-conservation test: that is global_flux_ratio (exact) and
+    column_sum_check (exact), both of which are unconditional.
 
     Computed entirely sparsely. The previous implementation called
     A.toarray(), which for a full field at 2 arcsec pixels is a
@@ -235,6 +308,7 @@ def partition_of_unity_band_ratio(
         For each fibre k, ratio = Fb_hat(k) / Fb_true(k)
         where Fb is band-integrated flux
     """
+    A = _as_projection_matrix(A, "partition_of_unity_band_ratio")
     cube_flux = np.asarray(cube_flux, float)
     flux_fib  = np.asarray(flux_fib, float)
     wave      = np.asarray(wave, float)
@@ -329,7 +403,7 @@ def run_all_checks(
     dict with keys flux_ratio, adjoint_worst, columns, neff_stats,
     per_fibre (array), passed (bool)
     """
-    A = result["A"]
+    A = _as_projection_matrix(result["A"], "run_all_checks")
     data = result.get("cube", result.get("map", None))
     if data is None:
         raise KeyError("result must contain 'cube' or 'map'")
@@ -372,12 +446,26 @@ def run_all_checks(
     )
 
     pf_med = float(np.nanmedian(per_fib)) if np.isfinite(per_fib).any() else np.nan
+    pf_lo = float(np.nanpercentile(per_fib, 5)) if np.isfinite(per_fib).any() else np.nan
+    pf_hi = float(np.nanpercentile(per_fib, 95)) if np.isfinite(per_fib).any() else np.nan
+
+    # The partition ratio is NOT part of the pass criterion. It is a weighted
+    # average over each fiber's neighbourhood, so it only equals 1 where the
+    # flux field is locally constant, and on a structured source it departs
+    # from 1 by an amount set by the SOURCE's contrast. Flagging that as a
+    # failure marks a correct pipeline as broken on every real target. The
+    # unconditional conservation tests are 1 and 4, which are exact.
+    #
+    # It is still worth looking at: a median far from 1 (beyond the loose
+    # bound below) means something stranger than source structure.
+    pf_wild = np.isfinite(pf_med) and abs(pf_med - 1.0) > 0.5
+
     passed = (
         abs(ratio - 1.0) < 1e-6
         and cols["n_dropped"] == 0
         and cols["all_unit"]
         and adj < 1e-9
-        and np.isfinite(pf_med) and abs(pf_med - 1.0) < 1e-2
+        and not pf_wild
     )
 
     if verbose:
@@ -390,9 +478,12 @@ def run_all_checks(
         print(f"  2. adjoint worst mismatch  : {adj:.3e}   "
               f"{'OK' if adj < 1e-9 else 'FAIL -- operator/transpose inconsistent'}")
         print(f"  3. per-fiber partition     : median {pf_med:.6f}, "
-              f"5-95% {np.nanpercentile(per_fib,5):.4f}.."
-              f"{np.nanpercentile(per_fib,95):.4f}   "
-              f"{'OK' if np.isfinite(pf_med) and abs(pf_med-1) < 1e-2 else 'FAIL'}")
+              f"5-95% {pf_lo:.4f}..{pf_hi:.4f}   "
+              f"{'FAIL -- far from 1' if pf_wild else 'info'}")
+        print(f"     (a neighbourhood average, so the spread measures SOURCE "
+              f"structure,")
+        print(f"      not flux loss -- 0.00 for a flat field, ~0.29 for a ring. "
+              f"See the docstring.)")
         print(f"  4. column sums             : {cols['n_dropped']} dropped of "
               f"{cols['n_fibers']}, all unit: {cols['all_unit']}")
         print(f"     N_eff inside footprint  : median {neff_stats['median']:.2f}, "
@@ -402,4 +493,6 @@ def run_all_checks(
         print("=" * 62)
 
     return dict(flux_ratio=ratio, adjoint_worst=adj, columns=cols,
-                neff_stats=neff_stats, per_fibre=per_fib, passed=passed)
+                neff_stats=neff_stats, per_fibre=per_fib,
+                per_fibre_median=pf_med, per_fibre_5=pf_lo, per_fibre_95=pf_hi,
+                passed=passed)

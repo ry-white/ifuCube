@@ -16,9 +16,9 @@ example run
 
 # Mosaic Halpha maps (FLUX HDU) using IVAR weights, conserve integrated flux:
 python -m ifuCube.mosaic \
-  --inputs lvmDAPMaps-00006112.fits lvmDAPMaps-00006113.fits lvmDAPMaps-00006114.fits lvmDAPMaps-00006115.fits lvmDAPMaps-00006116.fits lvmDAPMaps-00006117.fits \
+  --inputs lvmDAPMaps-00004123.fits lvmDAPMaps-00004124.fits lvmDAPMaps-00004125.fits \
   --hdu FLUX --weights-hdu IVAR \
-  --output mosaic_rosette.fits \
+  --output mosaic_orion.fits \
   --mode cube \
   --auto-wcs \
   --combine mean \
@@ -213,7 +213,7 @@ def _coadd_map_with_reproject(
     reproject_fn = _get_reproject_function(reproject_mode)
     # _combine_function maps the name to a real callable, including the
     # custom 'first'/'last' reducers that reproject does not know by name.
-    combine_fn = _combine_function(combine)
+    combine_fn = combine.lower()
 
     # Normalize inputs into list[(array, wcs)]
     arr_wcs: List[Tuple[np.ndarray, WCS]] = []
