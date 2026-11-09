@@ -141,19 +141,20 @@ def show_map(data, wcs=None, ax=None, label="", title=None, pct=(1, 99.5),
     colorbar : bool
         Attach one. Set False when you are managing a shared colorbar.
     east_left : bool
-        Put East on the left, the usual orientation for a sky image.
+        Keep East on the left, the usual orientation for a sky image.
 
-        This is NOT cosmetic here. fit_celestial_wcs produces CD1_1 > 0 (a
-        positive determinant), i.e. RA increasing with column index, which
-        is the mirror of the convention nearly every sky image follows. The
-        array and its WCS agree with each other, so coordinates read out
-        correctly either way -- but drawn as stored the field is flipped
-        left-right compared with how you would see it in DS9 or in a paper.
+        Maps built since radec_to_tangent_arcsec started returning x
+        increasing West are already in that orientation natively: CD1_1 < 0,
+        column index increases West, and the array drawn with origin="lower"
+        needs no help. For those this flag does nothing.
 
-        show_fibers has always inverted its x axis, so with east_left=False
-        the same field plotted as a map and as fibres comes out mirrored
-        between the two. Both functions take this flag and default it to
-        True so they agree. Set False on both to see the array as stored.
+        It exists for files written under the OLD convention (CD1_1 > 0, RA
+        increasing with column). Those are self-consistent and read back
+        correctly, but drawn as stored they are mirrored. With east_left=True
+        the axis is flipped for exactly those, so an old map and a new one
+        of the same field look the same way round. Detection is from the
+        WCS determinant, so it costs nothing and cannot misfire on a map
+        with no WCS. Set False to see the array exactly as stored.
 
     Returns
     -------
@@ -215,14 +216,27 @@ def show_map(data, wcs=None, ax=None, label="", title=None, pct=(1, 99.5),
     else:
         ax.set_xlabel("x [pixels]"); ax.set_ylabel("y [pixels]")
 
-    # Flip to East-left unless asked not to. Checked against the axis's
-    # current direction rather than applied blindly, so passing a shared
-    # `ax` through several calls cannot flip it twice.
-    if east_left:
+    # East-left is now the NATIVE orientation: radec_to_tangent_arcsec puts
+    # x increasing West, so the array column index increases West and a map
+    # drawn as stored already has North up and East left. Nothing to flip.
+    #
+    # Files written BEFORE that change have the opposite handedness
+    # (CD1_1 > 0). Their own WCS says so, so flip only when the WCS reports
+    # a positive determinant -- that way an old cube and a new one drawn
+    # side by side show the same field the same way round.
+    if east_left and wcs is not None and _wcs_is_east_right(wcs):
         lo, hi = ax.get_xlim()
         if hi > lo:
             ax.invert_xaxis()
     return ax
+
+
+def _wcs_is_east_right(wcs) -> bool:
+    """True if this WCS has RA increasing with column (the old convention)."""
+    try:
+        return bool(np.linalg.det(wcs.celestial.pixel_scale_matrix) > 0)
+    except Exception:
+        return False
 
 
 def show_planes(cube, names=None, wcs=None, ncols=3, label="",
@@ -452,11 +466,34 @@ def show_fibers(cat, c, label="", s=16, cmap="RdBu_r", pct=(2, 98), ax=None,
     ax.set_xlabel("x [arcsec]")
     ax.set_ylabel("y [arcsec]")
     ax.set_aspect("equal")
-    # x_arcsec is the skyoffset longitude, i.e. +East, so inverting gives the
-    # conventional North-up East-left orientation. Same default as show_map,
-    # so a fibre plot and a map of the same field are never mirrored.
-    if east_left:
+
+    # x_arcsec now increases WEST, so plotting it directly already puts East
+    # on the left and no inversion is wanted. A catalog written before that
+    # change has x increasing East and does need one. Rather than guess, ask
+    # the catalog: if it carries `ra`, the sign of the x-RA correlation says
+    # which convention it uses. Without `ra`, assume the current one.
+    if east_left and _cat_is_east_right(cat, xs):
         lo, hi = ax.get_xlim()
         if hi > lo:
             ax.invert_xaxis()
     return ax
+
+
+def _cat_is_east_right(cat, xs) -> bool:
+    """True if this catalog's x_arcsec increases with RA (the old convention).
+
+    Uses the correlation rather than a flag because old FIBERCAT tables carry
+    no version marker -- but they do carry `ra`, and the relationship between
+    the two columns is the convention.
+    """
+    names = getattr(cat, "colnames", None) or list(cat)
+    if "ra" not in names:
+        return False
+    ra = np.asarray(cat["ra"], float)
+    g = np.isfinite(ra) & np.isfinite(xs)
+    if g.sum() < 3:
+        return False
+    ra_u = np.unwrap(np.radians(ra[g]), period=2 * np.pi)
+    if np.ptp(ra_u) == 0 or np.ptp(xs[g]) == 0:
+        return False
+    return bool(np.corrcoef(ra_u, xs[g])[0, 1] > 0)

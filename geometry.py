@@ -354,16 +354,51 @@ def make_wcs3d(celestial_wcs: WCS, wave: np.ndarray,
     w3d.wcs.cd = cd3
     return w3d
 
-def radec_to_tangent_arcsec(ra_deg, dec_deg):
+def radec_to_tangent_arcsec(ra_deg, dec_deg, east_left: bool = True):
     """Exact tangent-plane offsets (arcsec) about the field's mean direction.
 
     The mean direction is computed by averaging unit vectors rather than
     averaging RA/Dec, so it is well behaved near the poles and across the
     RA = 0 wrap.
+
+    ORIENTATION -- x INCREASES WEST
+    ===============================
+    With east_left=True (the default), the returned x is MINUS the
+    skyoffset longitude, i.e. it increases toward WEST (decreasing RA).
+    That sign is what makes the finished product follow the standard sky
+    convention, and it is set here because this is the only place the
+    tangent plane is defined -- both io_lvm readers call it, and every grid,
+    projection matrix and WCS downstream inherits the choice.
+
+    Why the sign has to live here rather than being fixed later:
+
+      x increases West
+        -> make_grid_from_points builds an ASCENDING xg, as it always has
+        -> array column index increases West
+        -> RA DECREASES with column index
+        -> the fitted WCS has CD1_1 < 0 and a negative determinant
+
+    which is the orientation essentially every sky image uses, so the array
+    drawn with origin="lower" and no axis trickery already has North up and
+    East left, in this package and in DS9 and in anything else that reads
+    the WCS.
+
+    The alternative -- keeping x East and reversing the grid -- would make
+    xg descending, and kernels.build_projection_A locates each fibre's pixel
+    window with np.searchsorted, which requires an ascending array. It would
+    return empty or wrong windows with no error. One sign here is both
+    smaller and safer.
+
+    east_left=False restores the old behaviour (x increasing East, CD1_1 >
+    0). Files written before this change used that convention; their own
+    WCS still describes them correctly, so they read back fine, but their
+    FIBERCAT x_arcsec column has the opposite sign to new ones.
     """
     c = SkyCoord(np.asarray(ra_deg) * u.deg, np.asarray(dec_deg) * u.deg, frame="icrs")
     v = c.cartesian.xyz.value.mean(axis=1)
     center = SkyCoord(np.arctan2(v[1], v[0]) * u.rad,
                       np.arctan2(v[2], np.hypot(v[0], v[1])) * u.rad, frame="icrs")
     off = c.transform_to(center.skyoffset_frame())
-    return off.lon.to(u.arcsec).value, off.lat.to(u.arcsec).value
+    lon = off.lon.to(u.arcsec).value
+    lat = off.lat.to(u.arcsec).value
+    return (-lon if east_left else lon), lat
