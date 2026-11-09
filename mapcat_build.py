@@ -832,3 +832,118 @@ def read_map(
                 fibercat=cat, line_names=line_names,
                 wave=np.asarray(waves, float),
                 index=lambda name, _n=line_names: _plane_index(name, _n))
+
+# ---------------------------------------------------------------------------
+# Command line interface
+# ---------------------------------------------------------------------------
+#
+#   python -m ifuCube.mapcat_build --dap dap-rsp108-sn20-00006116.fits \
+#       --output mapcats/helix.fits --pixel 9 --kinematics vel disp --check
+#
+# Kinematic maps go to sibling files derived from --output, so
+# mapcats/helix.fits also produces mapcats/helix_vel.fits and
+# mapcats/helix_disp.fits. They reuse the same projection matrix, so they
+# land on exactly the same grid and WCS as the flux map.
+
+def main(argv=None) -> int:
+    import argparse
+    from pathlib import Path
+    from ._cli import (add_grid_args, add_fill_args, add_common_args,
+                       grid_kwargs, maybe_fill)
+
+    ap = argparse.ArgumentParser(
+        prog="python -m ifuCube.mapcat_build",
+        description="Build flux-conserving emission-line maps, and "
+                    "optionally kinematic maps, from an LVM DAP file.",
+        epilog="Maps are written as flux PER PIXEL (summing pixels gives "
+               "total flux); read_map() converts to surface brightness on "
+               "the way back in. Threshold on COVERAGE/COVPLATE, never on "
+               "raw COVERAGE.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    ap.add_argument("--dap", required=True, metavar="FITS",
+                    help="input DAP file")
+    ap.add_argument("--output", "-o", required=True, metavar="FITS",
+                    help="output map path; parent directories are created")
+
+    g = ap.add_argument_group("line selection")
+    g.add_argument("--lines", nargs="+", default=None, metavar="NAME",
+                   help="emission lines to map (default: every line the "
+                        "reader finds). Order sets the plane order, which is "
+                        "why read_map() gives you index('Halpha') instead of "
+                        "making you count planes.")
+    g.add_argument("--extra-cols", nargs="+", default=None, metavar="COL",
+                   help="additional DAP columns to carry into FIBERCAT; "
+                        "exact names or wildcards such as 'vel_*'")
+    g.add_argument("--no-kinematics", action="store_true",
+                   help="do not read per-line velocity and dispersion "
+                        "columns into FIBERCAT (smaller catalog)")
+    g.add_argument("--slitmap", default=None, metavar="FITS",
+                   help="file supplying the fibre mask; defaults to the DAP "
+                        "file itself, whose PT extension carries one")
+
+    add_grid_args(ap)
+
+    g = ap.add_argument_group("kinematic maps")
+    g.add_argument("--kinematics", nargs="+", default=None,
+                   choices=["vel", "disp"], metavar="QTY",
+                   help="also build weighted-average maps of these "
+                        "quantities, written to <output>_<qty>.fits. NOTE a "
+                        "DIFFERENT operator from flux: velocity is intensive, "
+                        "so it is averaged, not summed.")
+    g.add_argument("--kin-weighting", choices=["ivar", "equal"],
+                   default="ivar",
+                   help="per-fibre weighting for the kinematic average")
+    g.add_argument("--kin-min-weight-frac", type=float, default=0.05,
+                   metavar="FRAC",
+                   help="blank kinematic pixels whose weight sum falls below "
+                        "this fraction of the footprint median; raise toward "
+                        "0.2 for a figure")
+
+    add_fill_args(ap)
+    g = ap.add_argument_group("validation")
+    g.add_argument("--check", action="store_true",
+                   help="run diagnostics.run_all_checks on the built map "
+                        "(flux conservation, adjoint, column sums)")
+    add_common_args(ap)
+    args = ap.parse_args(argv)
+
+    from .io_lvm import read_dap_multi
+
+    verbose = not args.quiet
+    overwrite = not args.no_overwrite
+
+    fibers = read_dap_multi(args.dap,
+                            lines=args.lines,
+                            extra_cols=args.extra_cols,
+                            kinematics=not args.no_kinematics,
+                            slitmap_path=args.slitmap or args.dap,
+                            verbose=verbose)
+    fibers = maybe_fill(fibers, args, verbose=verbose)
+
+    result = build_map(fibers, **grid_kwargs(args))
+
+    if args.check:
+        from .diagnostics import run_all_checks
+        run_all_checks(result)
+
+    save_map_to_fits(result, args.output, overwrite=overwrite)
+    if verbose:
+        print(f"[map] wrote {args.output}  lines={result.get('line_names')}")
+
+    for qty in (args.kinematics or []):
+        kin = build_kinematic_map(result, quantity=qty,
+                                  weighting=args.kin_weighting,
+                                  min_weight_frac=args.kin_min_weight_frac,
+                                  verbose=verbose)
+        out = Path(args.output)
+        kin_path = out.with_name(f"{out.stem}_{qty}{out.suffix}")
+        save_map_to_fits(kin, str(kin_path), overwrite=overwrite)
+        if verbose:
+            print(f"[kin] wrote {kin_path}  ({qty}, {args.kin_weighting}-weighted)")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

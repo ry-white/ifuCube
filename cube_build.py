@@ -734,3 +734,92 @@ def read_cube(
 
     return dict(data=data, ivar=ivar, wave=wave, wcs3d=wcs3d, wcs2d=wcs2d,
                 bunit=bunit, header=hdr, pixel_area=area, plane_slice=sl)
+
+# ---------------------------------------------------------------------------
+# Command line interface
+# ---------------------------------------------------------------------------
+#
+#   python -m ifuCube.cube_build --sframe lvmSFrame-00006116.fits \
+#                                --output cubes/helix.fits --pixel 9
+#
+# Everything the CLI does is also available as a two-call Python API
+# (read_lvm_sframe then build_cube); this exists so a cube can be built from
+# a shell script or a job queue without writing a wrapper each time.
+
+def main(argv=None) -> int:
+    import argparse
+    from ._cli import (add_grid_args, add_fill_args, add_common_args,
+                       grid_kwargs, maybe_fill)
+
+    ap = argparse.ArgumentParser(
+        prog="python -m ifuCube.cube_build",
+        description="Build a flux-conserving 3D cube from an LVM sframe.",
+        epilog="Sizes at L=12401 planes, float32, full science IFU: "
+               "15\" -> 1.2 GB, 9\" -> 3.3 GB, 6\" -> 7.4 GB, 2\" -> 66 GB "
+               "(FLUX+IVAR). Pass --keep-memory only if you need the "
+               "in-memory cube unconverted afterwards.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    ap.add_argument("--sframe", required=True, metavar="FITS",
+                    help="input lvmSFrame row-stacked-spectra file")
+    ap.add_argument("--output", "-o", required=True, metavar="FITS",
+                    help="output cube path; parent directories are created")
+
+    add_grid_args(ap)
+
+    g = ap.add_argument_group("cube output")
+    g.add_argument("--units", choices=["surface_brightness", "flux_per_pixel"],
+                   default="surface_brightness",
+                   help="units to WRITE. surface_brightness divides by the "
+                        "pixel solid angle so the values do not depend on the "
+                        "grid; flux_per_pixel keeps the conserving quantity, "
+                        "so summing pixels gives total flux")
+    g.add_argument("--keep-memory", action="store_true",
+                   help="do NOT convert in place. Converting needs an array "
+                        "the caller does not own, so this allocates a second "
+                        "cube (~1.7 GB extra at 9\", ~33 GB at 2\"). Only "
+                        "needed if something reads the cube after saving, "
+                        "which a CLI run never does.")
+    g.add_argument("--dtype", choices=["float32", "float64"],
+                   default="float32",
+                   help="working and output precision; float32 halves peak "
+                        "memory and is what gets written to FITS anyway")
+    g.add_argument("--chunk-mb", type=float, default=256.0, metavar="MB",
+                   help="wavelength chunk budget per temporary; changes peak "
+                        "memory only, never the result")
+
+    add_fill_args(ap)
+    add_common_args(ap)
+    args = ap.parse_args(argv)
+
+    import numpy as _np
+    from .io_lvm import read_lvm_sframe
+
+    verbose = not args.quiet
+
+    fibers = read_lvm_sframe(args.sframe, verbose=verbose)
+    fibers = maybe_fill(fibers, args, verbose=verbose)
+
+    result = build_cube(fibers,
+                        dtype=_np.dtype(args.dtype),
+                        chunk_mb=args.chunk_mb,
+                        verbose=verbose,
+                        **grid_kwargs(args))
+
+    save_cube_to_fits(result, args.output,
+                      units=args.units,
+                      inplace=not args.keep_memory,
+                      overwrite=not args.no_overwrite)
+
+    if verbose:
+        cube = result["cube"]
+        nb = cube.nbytes
+        size = (f"{nb / 1024 ** 3:.2f} GB" if nb >= 1024 ** 3
+                else f"{nb / 1024 ** 2:.1f} MB")
+        print(f"[cube] wrote {args.output}  shape={cube.shape} "
+              f"({size} per array, {args.units})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
