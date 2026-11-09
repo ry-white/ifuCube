@@ -261,43 +261,299 @@ def build_map(
         fibercat=fibers.meta.get("fibercat"),
         fibermask=fibers.meta.get("fibermask"),
         mask_info=fibers.meta.get("mask_info"),
+        fill_info=fibers.meta.get("fill_info"),
     )
+
+_KIN_ALIASES = {
+    "vel":  ("vel", "velocity", "v", "vgas", "vel_gas"),
+    "disp": ("disp", "sigma", "sig", "vdisp", "disp_gas"),
+}
+
+
+def _find_kin_column(cat, quantity: str, line: str, err_prefix: str = "e_"):
+    """
+    Locate the value and error columns for one quantity of one line.
+
+    Why this is a search and not an f-string: DAP column spellings move
+    between releases and between the maps/cube products ('vel_Halpha',
+    'Halpha_vel', 'VEL_HA'), and an f-string that guesses wrong raises a
+    KeyError three functions deep. This tries every ordering of every alias
+    case-insensitively, then reports what it DID find so the message is
+    actionable.
+
+    Returns (value_column_name, error_column_name_or_None).
+    """
+    names = list(cat.keys())
+    low = {n.lower(): n for n in names}
+    stems = _KIN_ALIASES.get(quantity, (quantity,))
+    ln = str(line)
+
+    val = None
+    for st in stems:
+        for cand in (f"{st}_{ln}", f"{ln}_{st}", f"{st}{ln}", f"{ln}{st}"):
+            if cand.lower() in low:
+                val = low[cand.lower()]
+                break
+        if val:
+            break
+    if val is None:
+        near = [n for n in names if ln.lower() in n.lower()]
+        raise KeyError(
+            f"no {quantity!r} column for line {line!r}. Tried stems "
+            f"{stems} in both orders. Columns mentioning {line!r}: "
+            f"{near or 'none'}")
+
+    # The error column: same spelling, with the error marker bolted on in
+    # whichever of the two usual places.
+    err = None
+    for cand in (f"{err_prefix}{val}", f"{val}_err", f"{val}_error",
+                 f"{val}_e", f"e{val}"):
+        if cand.lower() in low:
+            err = low[cand.lower()]
+            break
+    return val, err
+
 
 def build_kinematic_map(
     result: Dict[str, Any],
-    quantity: str = "vel",  # can be dispersion too of course
+    quantity: str = "vel",
     lines: Optional[Sequence[str]] = None,
     weighting: str = "ivar",
-    min_weight_frac: float = 0.05, 
-    err_prefx: str = "e_",
+    min_weight_frac: float = 0.05,
+    err_prefix: str = "e_",
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
-    Build a kinematic map using the result of build_mapcat
+    Build a kinematic map by reusing an existing build_map() result.
+
+    A DIFFERENT OPERATOR FROM build_map
+    ===================================
+    build_map projects FLUX, which is an extensive quantity: it splits each
+    fiber's flux among pixels with column-normalised weights, so summing
+    pixels recovers the total. Velocity is intensive -- it does not add up.
+    Splatting velocity the same way would give a pixel the SUM of its
+    neighbours' velocities, so a region at a uniform -27 km/s with three
+    contributing fibers would read -81 km/s.
+
+    The right operator is a weighted AVERAGE: with w_k the per-fiber weight
+    and A the same projection matrix,
+
+        W_p      = sum_k A[p,k] * w_k                       (the normaliser)
+        v_p      = (1/W_p) * sum_k A[p,k] * w_k * v_k
+        Var(v_p) = (1/W_p**2) * sum_k (A[p,k] * w_k)**2 * Var(v_k)
+
+    Note the weights enter the variance SQUARED. This reuses result["A"], so
+    the kinematic map lands on exactly the same grid and WCS as the flux map
+    and the two can be divided, masked or stacked without reprojection.
+
+    MASKED FIBERS ARE ZEROED IN THE WEIGHTS, NOT IN THE VALUES
+    ==========================================================
+    build_map NaN-scrubs bad fluxes to 0.0, which is harmless there because a
+    zero contributes zero flux. Here it would be a disaster: 0 km/s is a
+    perfectly valid velocity, so a dead fiber scrubbed to zero drags its
+    whole kernel toward zero. Instead a fiber with a non-finite value, a
+    non-finite error, or a zero/negative error gets w_k = 0, which removes it
+    from both the numerator and the normaliser -- the pixel is then the
+    average of its surviving neighbours, which is the correct answer.
 
     Parameters
     ----------
-    result : Dict
-        output from build_mapcat containing A, coverage, fibercat
-    quantity : str 
-        quantity that is used to build the kinematic map (vel, disp)
-    lines : (Optional) Sequence
-        if a result is passed with multiple lines, you can pick which lines you
-        want a map to made with
-    weighting : str 
-        uses "ivar" weighting by default since errors/ivar should be found in ivar
-        but options include equal,
+    result : dict
+        Output of build_map(). Must still carry "A", "fibercat", "inside".
+    quantity : {"vel", "disp"} or any column stem present in the catalog
+        Aliases are resolved case-insensitively and in either word order.
+    lines : sequence of str, optional
+        Which lines to build. Default: every line in result["line_names"]
+        that has a column for this quantity.
+    weighting : {"ivar", "equal"}
+        "ivar": w_k = 1/sigma_k**2 from the error column -- the minimum
+        variance choice, and the one that automatically down-weights the
+        faint-line fits that dominate DAP kinematic scatter. "equal": w_k = 1
+        for every usable fiber, which is what you want if you suspect the
+        reported errors are wrong.
     min_weight_frac : float
-        default = 0.05,
+        Pixels whose normaliser W_p falls below this fraction of the
+        footprint median are set NaN. These are the edge pixels fed by a
+        single far-off fiber, where the "average" is one noisy number
+        stretched over many pixels. 0.05 is loose; raise it to 0.2 for a
+        figure.
+    err_prefix : str
+        Prefix marking the error column ("e_vel_Halpha").
 
-
+    Returns
+    -------
+    dict with
+        "map"        : (n_lines, ny, nx) weighted-average maps, NaN where
+                       unsampled. Units are the catalog's units -- km/s for
+                       vel; for DAP `disp_*` this is ANGSTROM, not km/s.
+        "ivar"       : matching inverse variance, 0 where map is NaN
+        "err"        : 1/sqrt(ivar), for convenience
+        "weight_sum" : (n_lines, ny, nx) the normaliser W_p
+        "neff_kin"   : (n_lines, ny, nx) Kish effective fiber count,
+                       (sum w)**2 / sum w**2, using the SAME weights as the
+                       average -- so this is the honest independent-sample
+                       count for these maps, not result["neff"]
+        "lines"      : list of line names actually built
+        "quantity", "weighting" : echoed
+        plus "xg", "yg", "inside", "wcs2d", "pixel_size_arcsec" copied from
+        `result`, so this dict can go straight to save_map_to_fits().
     """
+    A = result.get("A")
+    if A is None:
+        raise ValueError("result has no 'A'; pass the dict build_map returned")
+
+    # A is sparse (build_projection_A returns csr_matrix) and must STAY
+    # sparse: at 2" pixels a dense (P, K) would be hundreds of GB, and
+    # np.asarray() on it silently produces a 0-d object array that only
+    # fails later with an unreadable message. Everything below is written
+    # against a tiny shim so the same arithmetic runs either way.
+    import scipy.sparse as _sp
+    _issparse = _sp.issparse(A)
+    if not _issparse:
+        A = np.asarray(A, float)
+
+    cat = result.get("fibercat")
+    if not cat:
+        raise ValueError(
+            "result has no 'fibercat'. Kinematics live in the per-fiber "
+            "catalog, so read the DAP with a reader that builds one "
+            "(read_dap_multi(..., ) populates meta['fibercat']).")
+
+    inside = np.asarray(result["inside"], bool)
+    ny, nx = inside.shape
+    P, K = A.shape
+    if P != ny * nx:
+        raise ValueError(f"A has {P} rows but the grid has {ny*nx} pixels; "
+                         "this A was built for a different grid")
+
+    # Which lines to do. Default to every line that actually HAS a column,
+    # silently skipping the rest -- a DAP file commonly fits kinematics for
+    # the bright lines only, and failing the whole call because [OI]6300 has
+    # no velocity would be unhelpful.
+    if lines is None:
+        avail = result.get("line_names") or []
+        lines = []
+        for ln in avail:
+            try:
+                _find_kin_column(cat, quantity, ln, err_prefix)
+                lines.append(ln)
+            except KeyError:
+                pass
+        if not lines:
+            raise KeyError(
+                f"no line in {list(avail)} has a {quantity!r} column. "
+                f"Catalog columns: {sorted(cat.keys())[:30]}")
+    lines = [str(l) for l in lines]
+
+    out = np.full((len(lines), ny, nx), np.nan)
+    oiv = np.zeros((len(lines), ny, nx))
+    wsum = np.zeros((len(lines), ny, nx))
+    nkin = np.zeros((len(lines), ny, nx))
+
+    flat_inside = inside.ravel()
+
+    for i, ln in enumerate(lines):
+        vcol, ecol = _find_kin_column(cat, quantity, ln, err_prefix)
+        v = np.asarray(cat[vcol], float).ravel()
+        if v.size != K:
+            raise ValueError(
+                f"column {vcol!r} has {v.size} rows but A has {K} fibers. "
+                "The catalog must be the fibers that built this map, in the "
+                "same order -- did the map come from a different read?")
+
+        if ecol is not None:
+            e = np.asarray(cat[ecol], float).ravel()
+        else:
+            e = np.full(K, np.nan)
+
+        # Usable fibers. Note the error test is part of the usability test:
+        # a velocity with no error is not a measurement we can weight.
+        good = np.isfinite(v)
+        if weighting == "ivar":
+            good &= np.isfinite(e) & (e > 0)
+            w = np.where(good, 1.0 / np.maximum(e, 1e-30) ** 2, 0.0)
+        elif weighting == "equal":
+            w = good.astype(float)
+        else:
+            raise ValueError(f"weighting must be 'ivar' or 'equal', got {weighting!r}")
+
+        # Zero the WEIGHT, and zero the value only where its weight is
+        # already zero -- so a NaN can never enter the matrix product.
+        vz = np.where(good, v, 0.0)
+        var = np.where(good & np.isfinite(e) & (e > 0), e ** 2, 0.0)
+
+        # Aw[p,k] = A[p,k] * w_k, and Aw2 is that squared ELEMENTWISE (not a
+        # matrix square). For sparse A, .multiply() is elementwise and keeps
+        # the sparsity pattern; `A * w` would be a matrix product.
+        if _issparse:
+            Aw = A.multiply(w[None, :]).tocsr()
+            Aw2 = Aw.multiply(Aw)
+            W = np.asarray(Aw.sum(axis=1)).ravel()
+            s2 = np.asarray(Aw2.sum(axis=1)).ravel()
+        else:
+            Aw = A * w[None, :]
+            Aw2 = Aw ** 2
+            W = Aw.sum(axis=1)
+            s2 = Aw2.sum(axis=1)
+
+        num = Aw @ vz                       # (P,)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            vmap = num / W
+            # Var = (1/W^2) * sum_k (A[p,k] w_k)^2 Var(v_k)
+            vvar = (Aw2 @ var) / W ** 2
+            # Kish N_eff on the SAME weights that formed the average
+            neff_k = np.where(s2 > 0, W ** 2 / s2, 0.0)
+
+        # Drop pixels whose normaliser is a small fraction of the typical
+        # interior value: one distant fiber smeared over many pixels.
+        Win = W[flat_inside]
+        med = np.nanmedian(Win[Win > 0]) if np.any(Win > 0) else 0.0
+        bad = (~np.isfinite(vmap)) | (W <= min_weight_frac * med) | (~flat_inside)
+
+        vmap = np.where(bad, np.nan, vmap)
+        ivm = np.where(bad | ~np.isfinite(vvar) | (vvar <= 0), 0.0, 1.0 / vvar)
+
+        out[i] = vmap.reshape(ny, nx)
+        oiv[i] = ivm.reshape(ny, nx)
+        wsum[i] = W.reshape(ny, nx)
+        nkin[i] = np.where(bad, 0.0, neff_k).reshape(ny, nx)
+
+        if verbose:
+            fin = np.isfinite(out[i]) & inside
+            print(f"[kin] {ln:10s} {quantity}: col={vcol!r} err={ecol!r} "
+                  f"{int(good.sum())}/{K} fibers usable, "
+                  f"{int(fin.sum())}/{int(inside.sum())} pixels filled, "
+                  f"median={np.nanmedian(out[i][fin]):+.2f} "
+                  f"median err={np.nanmedian(1/np.sqrt(oiv[i][fin])):.2f} "
+                  f"median Neff={np.nanmedian(nkin[i][fin]):.2f}")
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        err = np.where(oiv > 0, 1.0 / np.sqrt(oiv), np.nan)
+
+    return dict(
+        map=out, ivar=oiv, err=err, weight_sum=wsum, neff_kin=nkin,
+        lines=lines, quantity=quantity, weighting=weighting,
+        # Copied through so this dict is accepted by save_map_to_fits().
+        neff=result.get("neff"), coverage=result.get("coverage"),
+        coverage_norm=result.get("coverage_norm"),
+        cov_plateau=result.get("cov_plateau"),
+        xg=result.get("xg"), yg=result.get("yg"), inside=inside,
+        wcs2d=result.get("wcs2d"), line_names=lines,
+        wave=np.asarray(result.get("wave", np.arange(len(lines))), float)[:len(lines)]
+             if np.size(result.get("wave", [])) >= len(lines)
+             else np.arange(len(lines), dtype=float),
+        pixel_size_arcsec=result.get("pixel_size_arcsec"),
+        fibercat=None, fibermask=None, mask_info=result.get("mask_info"),
+        fill_info=result.get("fill_info"),
+    )
 
 
 def save_map_to_fits(
     result: Dict[str, Any],
     path: str,
     extra_header: Optional[Dict[str, Any]] = None,
+    overwrite: bool = True,
 ) -> None:
     """
     Save an emission-line map result (from build_map) into a FITS file.
@@ -440,6 +696,23 @@ def save_map_to_fits(
         map_hdu.header["COVNOTE"] = ("COVERAGE/COVPLATE ~ 1 on the interior",
                                      "threshold on that, not on COVERAGE")
 
+    # Fill provenance, written whether or not any fiber was imputed --
+    # FILLED=F is information,
+    fi = result.get("fill_info") or {}
+    mh = map_hdu.header
+    mh["FILLED"] = (bool(fi.get("n_filled", 0)), "T if dead fibers were imputed")
+    if fi:
+        mh["FILLMETH"] = (str(fi.get("method", ""))[:20], "imputation method")
+        mh["FILLK"]    = (int(fi.get("k", 0)), "neighbors per estimate")
+        mh["FILLN"]    = (int(fi.get("n_filled", 0)), "fibers imputed")
+        mh["FILLSKIP"] = (int(fi.get("n_too_far", 0)), "refused: gap too large")
+        mh["FILLGAP"]  = (float(fi.get("max_gap_spacings", 0.0)),
+                          "worst mean-gap seen [fiber spacings]")
+        mh["FILLSPAC"] = (float(fi.get("spacing_arcsec", 0.0)),
+                          "median fiber spacing [arcsec]")
+        mh["COMMENT"]  = ("Some fibers were imputed; The FIBERCAT column "
+                          " 'imputed' flags which fibers were.")
+        
     fibermask = result.get("fibermask")
     if fibermask:
         from astropy.table import Table as _T
@@ -467,7 +740,7 @@ def save_map_to_fits(
     if str(_parent) not in ("", "."):
         _parent.mkdir(parents=True, exist_ok=True)
 
-    fits.HDUList(hdus).writeto(path, overwrite=True)
+    fits.HDUList(hdus).writeto(path, overwrite=overwrite)
 
 
 def _plane_index(name: str, names) -> int:

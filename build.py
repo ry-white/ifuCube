@@ -1,251 +1,619 @@
 #!/usr/bin/env python
+
 """
-build.py
+cube_build.py
+-------------
+High level cube builder
 
-Unifying CLI for 
-    - DAP multi-line emission maps
-    - SFrame cubes
-    - Ratio maps derived from map fits outputs
+Wires together:
+    - io_reader.FiberSet
+    - geometry.make_grid_from_points
+    - geometry.fit_celestial_wcs / make_wcs3d
+    - kernels.build_projection_A / splat_cube / ivar_through_A / neff_from_A
 
-(mosaic with mosaic.py)
+Units of the output
+-------------------
+build_cube is flux-conserving: a voxel value is an amount of flux per output
+pixel, and is therefore proportional to the pixel solid angle. Halve the pixel
+size and every value drops by four while the total stays fixed.
 
-python -m ifuCube.build dap-maps   --dap dap/dap-rsp108-sn20-00004163.dap.fits.gz   --fibermap /home/rwhite/lvmcore/metrology/lvm_fiducial_fibermap.yaml   --out lvmDAPMaps-00004163.fits   --lines Halpha Hbeta "[NII]6583" "[OIII]5007" "[SII]6731"   --pix 2.0 --fwhm 3.2 --frad 18.5 --rsigma 3.0 --kernel gauss
+That is the right thing to STORE, because it is the quantity the projection
+actually conserves, but it is the wrong thing to COMPARE: two cubes built at
+different pixel sizes are not comparable voxel by voxel, and averaging voxels
+without dividing by the pixel area makes the answer depend on a build
+parameter. Surface brightness has neither problem:
 
-Examples:
+    surface brightness [flux/arcsec**2] = FLUX / PIXAR_A2
+    its inverse variance                = IVAR * PIXAR_A2**2
 
-    # Build DAP maps
-    python -m ifuCube.build dap-maps \
-        --dap dap/dap-rsp108-sn20-00006112.dap.fits.gz \
-        --fibermap /home/rwhite/lvmcore/metrology/lvm_fiducial_fibermap.yaml \
-        --out lvmDAPMaps-00004297.fits \
-        --lines Halpha [NII]6583 [SII]6716 [SII]6731 \
-        --pix 2.0 --fwhm 3.2 --frad 18.5 --rsigma 3 --kernel gauss
+the weights entering squared because Var(F/omega) = Var(F)/omega**2.
 
-    python -m ifuCube.build dap-maps \
-        --dap ~/sas/sdsswork/lvm/spectro/analysis/1.2.1/0011XX/11111/60222/00006117/dap-rsp108-sn20-00006117.dap.fits.gz \
-        --fibermap /home/rwhite/lvmcore/metrology/lvm_fiducial_fibermap.yaml \
-        --out lvmDAPMaps-00006117.fits \
-        --lines Halpha [NII]6583 [OIII]5007 \
-        --pix 2.0 --fwhm 3.2 --frad 18.5 --rsigma 3 --kernel gauss
-    
-    # Build cube from SFrame
-    python -m ifuCube.build cube \
-        --sframe /home/rwhite/sas/sdsswork/lvm/spectro/redux/1.3.2/0011XX/11111/60191/lvmSFrame-00004297.fits \
-        --fibermap /home/rwhite/lvmcore/metrology/lvm_fiducial_fibermap.yaml \
-        --out lvmCubeClean-00004297.fits \
-        --pix 15.0 --fwhm 35 --frad 18.5 --rsigma 3 --kernel gauss
+Both ends are supported, and the header always says which you have:
 
-    # Build ratio map from a multi-line MAP FITS (output of dap-maps)
-    python build.py ratio \
-        --in lvmDAPMaps-00004297.fits \
-        --num "[NII]6583" \
-        --den "Halpha" \
-        --out ratio_NII_HA-00004297.fits
+    save_cube_to_fits(..., units="surface_brightness")   write SB directly
+    read_cube(path)                                      convert on the way in
+    read_cube(path, units="flux_per_pixel")              leave it as stored
 
+A further factor applies to extended emission. LVM fibers are 35.3" across on
+a 37" pitch, so they collect
 
+    APERFILL = pi * (35.3/2)**2 / ((sqrt(3)/2) * 37**2) = 0.8255
+
+of the sky inside the footprint; smooth emission therefore reads about 17%
+low. read_cube(..., correct_fill_factor=True) divides it out. It cancels in
+line ratios and in any LVM-to-LVM comparison, and matters when comparing
+against another survey or a model. See the mapcat_build module docstring.
+
+Memory
+------
+The output is L x ny x nx values, twice over (FLUX and IVAR), so a cube is
+memory-bound long before it is compute-bound. Measured on a 1801-fiber LVM
+bundle: at 2" the grid is 789 x 908 = 716,412 pixels, and the arithmetic takes
+about a minute, but the arrays do not fit anywhere convenient.
+
+Three things used to multiply, and two of them were avoidable:
+
+  1. pixel count, (15/2)**2 = 56x going from 15" to 2" pixels -- unavoidable,
+     and the honest part of the cost;
+  2. everything was float64 in memory, to write f4 to disk -- 2x wasted;
+  3. splat_cube ended with `C.T.reshape(L, ny, nx)`, and C.T is not
+     contiguous, so the reshape silently copied the whole cube. Measured peak
+     RSS / live arrays converged to 2.3x across pixel scales; that extra 1.3x
+     was this copy.
+
+This module now projects in float32, in chunks over wavelength, writing each
+chunk straight into a preallocated output through a flat view, so no
+full-size temporary is ever created. At L = 4000 and 2" pixels that takes
+peak memory from about 105 GB to about 25 GB. `chunk_mb` bounds the transient.
+
+A word on whether you want a 2" cube at all: the kernel FWHM is set by the
+fiber spacing (~37" for LVM), so a 2" grid stores ~56x more pixels carrying no
+more information. Fine sampling pays off when mosaicking many dithered
+pointings; for a single exposure, 5-8" already oversamples the beam.
 """
 
 from __future__ import annotations
-import argparse
-from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional, Dict, Any
 
+import numpy as np
 from astropy.io import fits
+from astropy.wcs import WCS
 
-from ifuCube.io_lvm import read_dap_multi, read_lvm_sframe, LINE_DEFS
-from ifuCube.mapcat_build import build_map, save_map_to_fits
-from ifuCube.cube_build import build_cube, save_cube_to_fits
-from ifuCube.ratio import build_ratio_from_map_fits
+from .io_readers import FiberSet
+from .geometry import (make_grid_from_points, fit_celestial_wcs, make_wcs3d,
+                       pixel_area_arcsec2)
+from .kernels import (build_projection_A, splat_cube, ivar_through_A,
+                      neff_from_A, coverage_from_A)
+
+try:                                    # keep the two modules agreeing
+    from .mapcat_build import LVM_FILL_FACTOR
+except ImportError:                     # older mapcat_build without it
+    LVM_FILL_FACTOR = (np.pi * (35.3 / 2) ** 2
+                       / ((np.sqrt(3) / 2) * 37.0 ** 2))      # 0.825477
+
+# splat_cube / ivar_through_A are imported for callers that still want the
+# one-shot versions (and mapcat_build uses them, where L is the number of
+# emission lines and chunking would be pointless). build_cube uses
+# _project_chunked below instead; see the module docstring.
 
 
-# Helpers 
-def _ensure_parent(path:Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-# Sub commands
-
-def cmd_dap_maps(args: argparse.Namespace) -> None:
-    dap_path = Path(args.dap)
-    fibermap_yaml = Path(args.fibermap) if args.fibermap else None
-    out_path = Path(args.out)
-    _ensure_parent(out_path)
-
-    fibers = read_dap_multi(
-        dap_path=dap_path,
-        fibermap_yaml=fibermap_yaml,
-        lines=args.lines,
-        extra_cols=args.extra_cols,
-        kinematics=not args.no_kinematics,
-        slitmap_path=args.slitmap,
-        mask_source=args.mask_source,
-        assume_all_science={"auto": "auto", "yes": True,
-                            "no": False}[args.assume_all_science],
-    )
-
-    result = build_map(
-        fibers=fibers,
-        pixel_size_arcsec=args.pix,
-        fwhm_arcsec=args.fwhm,
-        fiber_radius_arcsec=args.frad,
-        r_sigma_mult=args.rsigma,
-        kernel_mode=args.kernel,
-        wcs_strategy="fit",
-    )
-
-    save_map_to_fits(
-        result=result,
-        path=str(out_path),
-        extra_header={
-            "PIXSIZE": (args.pix, "arcsec per spaxel"),
-            "FWHM_ARC": (args.fwhm, "kernel FWHM arcsec"),
-            "FRAD_ARC": (args.frad, "fibre radius arcsec"),
-            "RSMULT": (args.rsigma, "sigma truncation mult"),
-            "KERNEL": (args.kernel, "kernel mode"),
-        },
-    )
-    print(f" Emission maps written to {out_path}")
-
-def cmd_ratio(args) -> None:
+def _project_chunked(
+    flux: np.ndarray,
+    ivar: np.ndarray,
+    A,
+    ny: int,
+    nx: int,
+    dtype=np.float32,
+    chunk_mb: float = 256.0,
+    verbose: bool = True,
+):
     """
-    Build ratio FITS from an existing multi-line map FITS.
+    Forward-project flux and propagate IVAR, in wavelength chunks.
+
+    Same arithmetic as kernels.splat_cube and kernels.ivar_through_A:
+
+        C      = A  @ F          flux, per output pixel
+        Var    = A^2 @ Var_in    weights enter SQUARED
+        ivar   = 1 / Var
+
+    What differs is only how the memory is handled, and that is the whole
+    point of the function:
+
+      * the outputs are allocated once, in `dtype` (float32 by default),
+        and written into through a flat (L, P) view. Assigning a transposed
+        (c, P) block into a contiguous destination is done element-wise by
+        numpy, so no intermediate copy of the block is made -- which is the
+        cost that `C.T.reshape(...)` was quietly paying on the whole cube.
+      * only one chunk of (P, c) is live at a time, so peak transient memory
+        is set by `chunk_mb` rather than by L.
+
+    Parameters
+    ----------
+    flux, ivar : (K, L)
+        Per-fiber spectra, already scrubbed of non-finite values.
+    A : (P, K) sparse
+        Projection matrix, columns summing to 1.
+    ny, nx : int
+        Spatial grid shape; ny * nx must equal A.shape[0].
+    dtype : numpy dtype
+        Working and output precision. float32 halves the memory and is what
+        gets written to FITS anyway. A flux-conserving sum over ~30 kernel
+        terms carries a relative error near 1e-7 in float32, far below any
+        calibration uncertainty. Pass np.float64 to reproduce the old
+        behaviour exactly.
+    chunk_mb : float
+        Target size of ONE temporary, in MB. Peak transient is roughly 3x
+        this (the matmul result, the variance block, and its reciprocal).
+
+    Returns
+    -------
+    cube, ivar_cube : (L, ny, nx) arrays of `dtype`
     """
-    in_map = Path(args.in_map)
-    out_ratio = Path(args.out)
+    K, L = flux.shape
+    P = ny * nx
+    if A.shape[0] != P:
+        raise ValueError(f"A.shape[0] ({A.shape[0]}) must equal ny*nx ({P})")
+    if A.shape[1] != K:
+        raise ValueError(f"A.shape[1] ({A.shape[1]}) must equal K ({K})")
 
-    build_ratio_from_map_fits(
-        map_fits=in_map,
-        numerator=args.num,
-        denominator=args.den,
-        out_fits=out_ratio,
-        map_hdu=args.map_hdu,
-        ivar_hdu=args.ivar_hdu,
-        neff_hdu=args.neff_hdu,
-        lines_hdu=args.lines_hdu,
-        min_den=args.min_den,
+    dtype = np.dtype(dtype)
+    itemsize = dtype.itemsize
+
+    # Chunk width from the memory budget, clamped to something sane.
+    chunk = int(max(1, min(L, (chunk_mb * 1e6) // (P * itemsize))))
+
+    # A is kept in its original precision in the result dict so that the
+    # diagnostics (column_sum_check uses atol=1e-12) still pass; only these
+    # working copies are cast down.
+    A_w = A.astype(dtype)
+    A2_w = A_w.multiply(A_w).tocsr()
+
+    cube = np.empty((L, ny, nx), dtype)
+    ivc = np.empty((L, ny, nx), dtype)
+    cube_flat = cube.reshape(L, P)          # free view: cube is contiguous
+    ivc_flat = ivc.reshape(L, P)
+
+    if verbose:
+        n_chunks = int(np.ceil(L / chunk))
+        print(f"[cube] {L} planes in {n_chunks} chunk(s) of {chunk}, "
+              f"{dtype.name}: output {2 * cube.nbytes / 1e9:.2f} GB, "
+              f"transient ~{3 * P * chunk * itemsize / 1e9:.2f} GB")
+
+    big = np.finfo(dtype).max
+    for i0 in range(0, L, chunk):
+        sl = slice(i0, min(i0 + chunk, L))
+
+        cube_flat[sl] = (A_w @ flux[:, sl]).T
+
+        # var_in is (K, c) and tiny next to (P, c); inf marks "no information",
+        # and clipping keeps a legitimately huge variance from overflowing to
+        # inf in float32, which would silently become ivar = 0.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            iv = ivar[:, sl]
+            var_in = np.where(iv > 0, 1.0 / np.where(iv > 0, iv, 1.0), np.inf)
+        np.clip(var_in, None, big, out=var_in, where=np.isfinite(var_in))
+
+        Var = A2_w @ var_in                 # (P, c)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            np.reciprocal(Var, out=Var)     # 1/inf -> 0 ; 1/0 -> inf
+        Var[~np.isfinite(Var)] = 0.0        # the 1/0 case: no contributing fiber
+        ivc_flat[sl] = Var.T
+
+    return cube, ivc
+
+def build_cube(
+    fibers: FiberSet,
+    pixel_size_arcsec: float,
+    fwhm_arcsec: float,
+    fiber_radius_arcsec: float,
+    r_sigma_mult: float = 3.0,
+    kernel_mode: str = "gauss",
+    wcs_strategy: str = "fit", # "fit" or "none"
+    max_dropped_frac: float = 0.02,
+    dtype=np.float32,
+    chunk_mb: float = 256.0,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Build a 3D flux-conserving cube from FiberSet
+
+    Steps
+    -----
+    1. Build a grid + inside_IFU mask
+    2. Build the projection matrix A (pixels x fibers)
+    3. Forward project fiber spectra -> cube
+    4. Propagate IVAR through A
+    5. Compute Neff and coverage maps.
+    6. Optionally fit a celestial WCS and embed into 3D.
+
+    Parameters
+    ----------
+    fibers : FiberSet
+        Input fiber data
+    pixel_size_arcsec : float
+        spaxel size
+    fwhm_arcsec : float
+        Kernel FWHM used for splatting. Set this from the fiber spacing
+        (~37 arcsec for LVM), not from the pixel size -- see kernels.py.
+    fiber_radius_arcsec : float
+        Fiber radius; sets the grid padding and hull expansion.
+    r_sigma_mult : float
+        Sigma multiplier for truncation radius
+    kernel_mode : {"gauss", "tophat"}
+        Kernel type
+    wcs_strategy : {"fit", "none"}
+        If "fit", use fibers.meta["ra_deg"], ["dec_deg"] to fit a celestial WCS
+    max_dropped_frac : float
+        Forwarded to build_projection_A: refuse to build if more than this
+        fraction of fibers would have their flux discarded.
+    dtype : numpy dtype
+        Working and output precision for the cube and its IVAR. float32 is
+        the default and is what gets written to FITS anyway; it halves peak
+        memory. Pass np.float64 for the old behaviour.
+    chunk_mb : float
+        Wavelength chunking budget, in MB per temporary. Lower it on a small
+        machine; it does not change the result, only the peak memory.
+    verbose : bool
+        Print the chunk plan and the resulting array sizes.
+
+    Returns
+    -------
+    results : dict with keys
+        "cube" : (L, ny, nx) flux cube
+        "ivar" : same shape, inverse variance cube
+        "neff" : (ny, nx) effective number of fibers per pixel
+        "coverage" : (ny, nx) summed kernel weight per pixel (row sums of A)
+        "A"    : (P, K) projection matrix
+        "xg", "yg", "inside" : grid and IFU mask
+        "wcs3d": WCS or None
+        "wcs2d": the celestial part, or None
+        "wave" : wavelength array
+        "pixel_size_arcsec" : echoed back for save_cube_to_fits
+    """
+    wave = np.asarray(fibers.wave, float)
+    x = np.asarray(fibers.x_arcsec, float)
+    y = np.asarray(fibers.y_arcsec, float)
+
+    # A single NaN fiber flux propagates to every pixel in that fiber's
+    # kernel support, so scrub before projecting.
+    dtype = np.dtype(dtype)
+    flux = np.nan_to_num(np.asarray(fibers.flux, dtype),
+                         nan=0.0, posinf=0.0, neginf=0.0)
+    ivar = np.nan_to_num(np.asarray(fibers.ivar, dtype),
+                         nan=0.0, posinf=0.0, neginf=0.0)
+
+    # 1) Grid + mask.
+    # fiber_radius_arcsec was previously not forwarded here, so the grid
+    # padding and hull expansion silently used the 18.5" default regardless
+    # of what the caller asked for.
+    xg, yg, inside = make_grid_from_points(
+        x_arcsec=x,
+        y_arcsec=y,
+        pixel_size_arcsec=pixel_size_arcsec,
+        fiber_radius_arcsec=fiber_radius_arcsec,
     )
-    print(f"[✓] Ratio map written to {out_ratio}  ({args.num}/{args.den})")
+    ny, nx = inside.shape
 
-def cmd_cube(args: argparse.Namespace) -> None:
-    sframe_path = Path(args.sframe)
-    fibermap_yaml = Path(args.fibermap) if args.fibermap else None
-    out_path = Path(args.out)
-    _ensure_parent(out_path)
-
-    fibers = read_lvm_sframe(
-        sframe_path=sframe_path,
-        fibermap_yaml=fibermap_yaml,
-        mask_source=args.mask_source,
+    # 2) Projection matrix
+    A = build_projection_A(
+        x_arcsec=x,
+        y_arcsec=y,
+        xg=xg,
+        yg=yg,
+        inside_mask=inside,
+        fwhm_arcsec=fwhm_arcsec,
+        fiber_radius_arcsec=fiber_radius_arcsec,
+        r_sigma_mult=r_sigma_mult,
+        mode=kernel_mode,
+        max_dropped_frac=max_dropped_frac,
     )
 
-    result = build_cube(
-        fibers=fibers,
-        pixel_size_arcsec=args.pix,
-        fwhm_arcsec=args.fwhm,
-        fiber_radius_arcsec=args.frad,
-        r_sigma_mult=args.rsigma,
-        kernel_mode=args.kernel,
-        wcs_strategy="fit",
+    # 3+4) Forward projection and IVAR propagation, chunked over wavelength.
+    # Done together so each chunk of the spectra is touched once; see
+    # _project_chunked for why this is not just splat_cube + ivar_through_A.
+    cube, ivar_cube = _project_chunked(
+        flux, ivar, A, ny=ny, nx=nx,
+        dtype=dtype, chunk_mb=chunk_mb, verbose=verbose,
     )
 
-    save_cube_to_fits(
-        result=result,
-        path=str(out_path),
-        extra_header={
-            "PIXSIZE": (args.pix, "arcsec per spaxel"),
-            "FWHM_ARC": (args.fwhm, "kernel FWHM arcsec"),
-            "FRAD_ARC": (args.frad, "fibre radius arcsec"),
-            "RSMULT": (args.rsigma, "sigma truncation mult"),
-            "KERNEL": (args.kernel, "kernel mode"),
-        },
+    # 5) Neff + coverage
+    neff = neff_from_A(A, ny=ny, nx=nx)
+    coverage = coverage_from_A(A, ny=ny, nx=nx)
+
+    # 6) WCS.
+    # x0/y0 must be the grid origin -- see geometry.py module docstring.
+    wcs2d: Optional[WCS] = None
+    wcs3d: Optional[WCS] = None
+    if wcs_strategy == "fit" and "ra_deg" in fibers.meta and "dec_deg" in fibers.meta:
+        wcs2d = fit_celestial_wcs(
+            x_arcsec=x,
+            y_arcsec=y,
+            ra_deg=np.asarray(fibers.meta["ra_deg"], float),
+            dec_deg=np.asarray(fibers.meta["dec_deg"], float),
+            pixel_size_arcsec=pixel_size_arcsec,
+            x0_arcsec=xg[0],
+            y0_arcsec=yg[0],
+        )
+        wcs3d = make_wcs3d(wcs2d, wave)
+
+    return dict(
+        cube=cube,
+        ivar=ivar_cube,
+        neff=neff,
+        coverage=coverage,
+        A=A,
+        xg=xg,
+        yg=yg,
+        inside=inside,
+        wcs3d=wcs3d,
+        wcs2d=wcs2d,
+        wave=wave,
+        pixel_size_arcsec=float(pixel_size_arcsec),
+        flux_in=flux,
     )
-    print(f" Cube written to {out_path}")
+
+def save_cube_to_fits(
+    result: Dict[str, Any],
+    path: str,
+    extra_header: Optional[Dict[str, Any]] = None,
+    units: str = "flux_per_pixel",
+    inplace: bool = False,
+) -> None:
+    """
+    Write a cube result (from build_cube) to a FITS file
+
+    Layout:
+        HDU 0 : PRIMARY (optional metadata)
+        HDU 1 : FLUX (L, ny, nx)
+        HDU 2 : IVAR (L, ny, nx)
+        HDU 3 : NEFF (ny, nx)
+        HDU 4 : WAVE (BinTable, column 'WAVE')
+        HDU 5 : COVERAGE (ny, nx), if present
+
+    WCS is attached to FLUX (3D) and to the 2D auxiliary images.
+    The WAVE table holds the exact wavelength grid; the CD3_3 in the header
+    can only describe a linear axis, so trust the table if they disagree.
+
+    Parameters
+    ----------
+    units : {"flux_per_pixel", "surface_brightness"}
+        What to WRITE. "flux_per_pixel" (default) stores the flux-conserving
+        quantity the projection produces, and read_cube converts on the way
+        back in. "surface_brightness" divides by the pixel solid angle before
+        writing, which is the better choice when the file is a catalog
+        product that other people (or other pixel scales) will consume: the
+        values no longer depend on the grid it happened to be built on. The
+        header records the choice in BUNIT and SBCONV, and read_cube refuses
+        to convert an already-converted file.
+    inplace : bool
+        Only consulted when converting. False (default) converts a copy, so
+        `result` is left untouched; that copy is the same one the f4 cast
+        would make anyway. True divides the caller's arrays in place, which
+        MUTATES `result` -- use it when the cube is large enough that a
+        second copy is the difference between writing and swapping.
+    """
+    if units not in ("flux_per_pixel", "surface_brightness"):
+        raise ValueError("units must be 'flux_per_pixel' or "
+                         f"'surface_brightness', got {units!r}")
+    cube = result["cube"]
+    ivar = result["ivar"]
+    neff = result["neff"]
+    wave = np.asarray(result["wave"], float)
+    wcs3d: Optional[WCS] = result.get("wcs3d", None)
+    wcs2d: Optional[WCS] = result.get("wcs2d", None)
+    coverage = result.get("coverage", None)
+
+    if cube.shape != ivar.shape:
+        raise ValueError("cube and ivar must have same shape")
+
+    primary_hdu = fits.PrimaryHDU()
+    if extra_header:
+        for k, v in extra_header.items():
+            primary_hdu.header[k] = v
+
+    if wcs3d is not None:
+        flux_header = wcs3d.to_header(relax=True)
+    else:
+        flux_header = fits.Header()
+
+    if wcs2d is not None:
+        pix_area = pixel_area_arcsec2(wcs2d)
+    elif wcs3d is not None:
+        pix_area = pixel_area_arcsec2(wcs3d)
+    else:
+        ps = result.get("pixel_size_arcsec", None)
+        pix_area = float(ps) ** 2 if ps else None
+
+    flux_header["BUNIT"] = ("flux/pixel", "flux-conserving: amount per output pixel")
+    if pix_area is not None:
+        flux_header["PIXAR_A2"] = (pix_area, "pixel solid angle [arcsec**2]")
+    flux_header["FLUXCONS"] = (True, "columns of projection matrix A sum to 1")
+
+    ivar_header = flux_header.copy()
+    ivar_header["BUNIT"] = ("1/(flux/pixel)**2", "inverse variance of FLUX")
+    aux_hdr = wcs2d.to_header(relax=True) if wcs2d is not None else fits.Header()
+
+    # astype(copy=False) is a no-op when the cube is already float32, which it
+    # is by default now. Without copy=False this line duplicated the entire
+    # cube a second time, at the worst possible moment.
+    # Convert before casting, so the division happens once. astype(copy=False)
+    # is a no-op when the cube is already float32 (the default), which is why
+    # the copy has to be forced here when we are about to divide in place and
+    # the caller did not consent to their array being modified.
+    want_sb = units == "surface_brightness"
+    if want_sb and pix_area is None:
+        raise ValueError(
+            "cannot convert to surface brightness: no pixel area is "
+            "available. Build with wcs_strategy='fit', or pass "
+            "pixel_size_arcsec in the result."
+        )
+
+    cube_out = np.asarray(cube).astype("f4", copy=(want_sb and not inplace))
+    ivar_out = np.asarray(ivar).astype("f4", copy=(want_sb and not inplace))
+    if want_sb:
+        cube_out /= np.float32(pix_area)            # flux/pixel -> flux/arcsec**2
+        ivar_out *= np.float32(pix_area) ** 2       # Var scales as area**2
+        flux_header["BUNIT"] = ("flux/arcsec**2",
+                                "surface brightness: FLUX / PIXAR_A2")
+        ivar_header["BUNIT"] = ("1/(flux/arcsec**2)**2", "inverse variance of FLUX")
+    flux_header["SBCONV"] = (bool(want_sb), "T if already divided by PIXAR_A2")
+    ivar_header["SBCONV"] = (bool(want_sb), "T if already multiplied by PIXAR_A2**2")
+    flux_header["APERFILL"] = (round(float(LVM_FILL_FACTOR), 4),
+                               "fiber fill factor; see read_cube")
+    for line in (
+        "FLUX is flux per pixel unless SBCONV is T, in which case it has",
+        "already been divided by PIXAR_A2 and is a surface brightness.",
+        "  surface brightness [flux/arcsec**2] = FLUX / PIXAR_A2",
+        "  its inverse variance                = IVAR * PIXAR_A2**2",
+        "Fibers cover APERFILL of the sky (35.3in apertures, 37in hex grid);",
+        "divide surface brightness by APERFILL for true sky brightness.",
+        "ifuCube.cube_build.read_cube() applies both conversions.",
+    ):
+        flux_header["COMMENT"] = line
+
+    cube_hdu = fits.ImageHDU(cube_out, header=flux_header, name="FLUX")
+    ivar_hdu = fits.ImageHDU(ivar_out, header=ivar_header, name="IVAR")
+    neff_hdu = fits.ImageHDU(np.asarray(neff, float).astype("f4"),
+                             header=aux_hdr, name="NEFF")
+
+    col = fits.Column(name="WAVE", format="E", unit="Angstrom", array=wave.astype("f4"))
+    wave_hdu = fits.BinTableHDU.from_columns([col], name="WAVE")
+
+    hdus = [primary_hdu, cube_hdu, ivar_hdu, neff_hdu, wave_hdu]
+    if coverage is not None:
+        hdus.append(fits.ImageHDU(np.asarray(coverage, float).astype("f4"),
+                                  header=aux_hdr, name="COVERAGE"))
+
+    fits.HDUList(hdus).writeto(path, overwrite=True)
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description="Build IFU cubes/maps/ratios.")
-    sub = p.add_subparsers(dest="cmd", required=True)
+def read_cube(
+    path: str,
+    units: str = "surface_brightness",
+    correct_fill_factor: bool = False,
+    hdu: str = "FLUX",
+    wave_range: Optional[tuple] = None,
+    planes: Optional[slice] = None,
+    with_ivar: bool = True,
+) -> Dict[str, Any]:
+    """
+    Read a cube written by save_cube_to_fits, converting units on the way in.
 
-    # ---- dap-maps ----
-    p_map = sub.add_parser("dap-maps", help="Build multi-line DAP emission maps")
-    p_map.add_argument("--dap", required=True, help="DAP file path")
-    p_map.add_argument("--fibermap", default=None,
-                       help="fiducial fibermap YAML. OPTIONAL and a last resort: "
-                            "targettype/fibstatus are preferred from the DAP table "
-                            "or --slitmap, which describe this exposure")
-    p_map.add_argument("--slitmap", default=None,
-                       help="FITS file with a SLITMAP extension (normally the sframe "
-                            "this DAP file came from); used if the DAP table itself "
-                            "has no targettype/fibstatus")
-    p_map.add_argument("--assume-all-science", dest="assume_all_science",
-                       choices=["auto", "yes", "no"], default="auto",
-                       help="what to do when no source has targettype (e.g. a DAP PT "
-                            "table). 'auto' (default) decides from the row count: a "
-                            "table larger than the science-fibre complement must still "
-                            "hold sky fibres and is refused. 'yes' forces, 'no' always "
-                            "raises")
-    p_map.add_argument("--mask-source", dest="mask_source", default="auto",
-                       choices=["auto", "table", "slitmap", "yaml"],
-                       help="pin the mask to one source instead of the auto chain")
-    p_map.add_argument("--out", required=True, help="Output FITS map filename")
+    The mirror of mapcat_build.read_map, and it exists for the same reason:
+    writing BUNIT tells a reader what the numbers mean, this does the
+    conversion for them, from the file's own header rather than from
+    remembered constants.
 
-    p_map.add_argument("--lines", nargs="+", default=["Halpha"],
-                       help=f"Logical line names; choose from {sorted(LINE_DEFS)}")
-    p_map.add_argument("--extra-cols", nargs="+", default=None,
-                       help='Extra DAP columns for the FIBERCAT table, names or wildcards, e.g. "vel_*". '
-                            'For non-per-line quantities; each requested line already brings its own kinematics.')
-    p_map.add_argument("--no-kinematics", action="store_true",
-                       help="Do not add each line's velocity/dispersion (and errors) to FIBERCAT. "
-                            "By default they are derived from the line's flux column stem "
-                            "(flux_Halpha_6562.85 -> vel_Halpha_6562.85, ...) and any that the "
-                            "DAP file does not have are reported and skipped.")
-    p_map.add_argument("--pix", type=float, default=2.0, help="Spaxel size in arcsec")
-    p_map.add_argument("--fwhm", type=float, default=3.2, help="Gaussian kernel FWHM in arcsec (set from fiber spacing ~35, not from --pix)")
-    p_map.add_argument("--frad", type=float, default=18.5, help="Fibre radius in arcsec")
-    p_map.add_argument("--rsigma", type=float, default=3.0, help="Sigma multiplier for kernel truncation")
-    p_map.add_argument("--kernel", choices=["gauss", "tophat"], default="gauss")
+    Parameters
+    ----------
+    path : str
+        Cube FITS file.
+    units : {"surface_brightness", "flux_per_pixel"}
+        What you want back. "surface_brightness" (the default) is independent
+        of the pixel size the cube was built with, so cubes built at
+        different scales can be compared voxel by voxel. "flux_per_pixel"
+        returns the flux-conserving values; sum voxels for a total flux.
 
-    p_map.set_defaults(func=cmd_dap_maps)
+        The conversion is keyed off the file's SBCONV keyword rather than
+        off what the caller remembers, so it is idempotent in both
+        directions: asking for surface brightness from a file that already
+        holds surface brightness hands it back unchanged instead of
+        dividing by the pixel area a second time. That double division is
+        the mistake you would otherwise make exactly once, months later, on
+        a file you had forgotten about.
+    correct_fill_factor : bool
+        Also divide by APERFILL (~0.8255), so smooth extended emission
+        matches the true sky surface brightness. Only valid together with
+        units="surface_brightness"; it cancels in line ratios.
+    wave_range : (lo, hi), optional
+        Wavelengths in Angstrom. ONLY the matching planes are read off disk,
+        via a memory-mapped slice, so a 70 GB cube costs whatever the window
+        costs. This is usually what you want -- a full LVM cube is ~12,400
+        planes and a line window is a few hundred.
+    planes : slice, optional
+        Plane indices, as an alternative to wave_range. Ignored if
+        wave_range is given.
+    with_ivar : bool
+        Read and convert IVAR too. False halves the memory and the I/O when
+        you only want to look at the flux.
 
-    # ---- cube ----
-    p_cube = sub.add_parser("cube", help="Build a cube from an LVM SFrame")
-    p_cube.add_argument("--sframe", required=True, help="SFrame FITS path")
-    p_cube.add_argument("--fibermap", default=None,
-                        help="fiducial fibermap YAML. OPTIONAL: the sframe's own "
-                             "SLITMAP normally carries targettype/fibstatus and is "
-                             "preferred, since it describes this exposure")
-    p_cube.add_argument("--mask-source", dest="mask_source", default="auto",
-                        choices=["auto", "table", "yaml"],
-                        help="pin the mask to one source ('table' = the SLITMAP)")
-    p_cube.add_argument("--out", required=True, help="Output FITS cube filename")
+    Returns
+    -------
+    dict with data, ivar, wave, wcs3d, wcs2d, bunit, header, pixel_area,
+    plane_slice (what was actually read).
+    """
+    if units not in ("surface_brightness", "flux_per_pixel"):
+        raise ValueError("units must be 'surface_brightness' or "
+                         f"'flux_per_pixel', got {units!r}")
+    if correct_fill_factor and units != "surface_brightness":
+        raise ValueError("correct_fill_factor needs units='surface_brightness'")
 
-    p_cube.add_argument("--pix", type=float, default=2.0, help="Spaxel size in arcsec")
-    p_cube.add_argument("--fwhm", type=float, default=3.2, help="Gaussian kernel FWHM in arcsec (set from fiber spacing ~35, not from --pix)")
-    p_cube.add_argument("--frad", type=float, default=18.5, help="Fibre radius in arcsec")
-    p_cube.add_argument("--rsigma", type=float, default=3.0, help="Sigma multiplier for kernel truncation")
-    p_cube.add_argument("--kernel", choices=["gauss", "tophat"], default="gauss")
+    # memmap so that slicing reads only the bytes we ask for
+    with fits.open(path, memmap=True) as hdul:
+        if hdu not in hdul:
+            raise ValueError(f"HDU {hdu!r} not found. Available: "
+                             f"{[h.name for h in hdul]}")
+        hdr = hdul[hdu].header
 
-    p_cube.set_defaults(func=cmd_cube)
+        if "WAVE" in hdul:
+            wave_all = np.asarray(hdul["WAVE"].data["WAVE"], float)
+        else:
+            wave_all = np.arange(hdul[hdu].shape[0], dtype=float)
 
-    # ---- ratio ----
-    p_ratio = sub.add_parser("ratio", help="Build a ratio FITS from an existing multi-line map FITS")
-    p_ratio.add_argument("--in-map", required=True, help="Input multi-line map FITS (from save_map_to_fits)")
-    p_ratio.add_argument("--out", required=True, help="Output ratio FITS filename")
-    p_ratio.add_argument("--num", required=True, help="Numerator line name (must match LINES.LINE_NAME)")
-    p_ratio.add_argument("--den", required=True, help="Denominator line name (must match LINES.LINE_NAME)")
-    p_ratio.add_argument("--min-den", type=float, default=0.0,
-                         help="Require |den| > min_den to form ratio")
+        if wave_range is not None:
+            lo, hi = float(wave_range[0]), float(wave_range[1])
+            idx = np.nonzero((wave_all >= lo) & (wave_all <= hi))[0]
+            if idx.size == 0:
+                raise ValueError(
+                    f"no planes between {lo} and {hi} Angstrom; the cube "
+                    f"spans {wave_all.min():.1f} to {wave_all.max():.1f}")
+            sl = slice(int(idx[0]), int(idx[-1]) + 1)
+        elif planes is not None:
+            sl = planes
+        else:
+            sl = slice(None)
 
-    # allow HDU name overrides (defaults match your save_map_to_fits layout)
-    p_ratio.add_argument("--map-hdu", default="FLUX", help="HDU for the line maps (default: MAP)")
-    p_ratio.add_argument("--ivar-hdu", default="IVAR", help="HDU for IVAR maps (default: IVAR)")
-    p_ratio.add_argument("--neff-hdu", default="NEFF", help="HDU for NEFF map (default: NEFF)")
-    p_ratio.add_argument("--lines-hdu", default="LINES", help="HDU for line metadata table (default: LINES)")
+        data = np.array(hdul[hdu].data[sl], dtype=np.float32)
+        wave = wave_all[sl]
+        ivar = (np.array(hdul["IVAR"].data[sl], dtype=np.float32)
+                if (with_ivar and "IVAR" in hdul) else None)
 
-    p_ratio.set_defaults(func=cmd_ratio)
+        wcs3d = WCS(hdr)
+        wcs2d = wcs3d.celestial if wcs3d.naxis >= 2 else None
 
-    args = p.parse_args()
-    args.func(args)
+    bunit = str(hdr.get("BUNIT", "flux/pixel")).strip()
+    already_sb = bool(hdr.get("SBCONV", False))
 
+    if wcs2d is not None and wcs2d.naxis == 2:
+        area = float(hdr.get("PIXAR_A2", pixel_area_arcsec2(wcs2d)))
+    else:
+        area = float(hdr["PIXAR_A2"]) if "PIXAR_A2" in hdr else None
 
-if __name__ == "__main__":
-    main()
+    if units == "surface_brightness" and not already_sb:
+        if area is None:
+            raise ValueError("no PIXAR_A2 and no usable WCS, so the pixel "
+                             "area is unknown and SB cannot be computed")
+        data /= np.float32(area)                   # in place: no second cube
+        if ivar is not None:
+            ivar *= np.float32(area) ** 2
+        bunit = "flux/arcsec**2"
+    elif units == "flux_per_pixel" and already_sb:
+        if area is None:
+            raise ValueError("file is surface brightness but has no "
+                             "PIXAR_A2, so it cannot be converted back")
+        data *= np.float32(area)
+        if ivar is not None:
+            ivar /= np.float32(area) ** 2
+        bunit = "flux/pixel"
+    elif units == "surface_brightness" and already_sb:
+        bunit = bunit or "flux/arcsec**2"
+
+    if correct_fill_factor:
+        fill = float(hdr.get("APERFILL", LVM_FILL_FACTOR))
+        data /= np.float32(fill)
+        if ivar is not None:
+            ivar *= np.float32(fill) ** 2
+        bunit = f"{bunit} (aperture-fill corrected)"
+
+    return dict(data=data, ivar=ivar, wave=wave, wcs3d=wcs3d, wcs2d=wcs2d,
+                bunit=bunit, header=hdr, pixel_area=area, plane_slice=sl)
