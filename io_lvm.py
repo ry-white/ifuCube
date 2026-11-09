@@ -55,7 +55,7 @@ adds any other DAP columns (exact names or wildcards such as "vel_*").
 save_map_to_fits writes it as a FIBERCAT binary table. Use
 list_dap_columns() to see what a DAP file contains.
 
-Kinematics follow the lines you asked for
+Kinematics follow the lines you ask for
 -----------------------------------------
 With kinematics=True (the default), each requested line also contributes its
 velocity and velocity dispersion, with errors. The column names are not
