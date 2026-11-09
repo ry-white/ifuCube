@@ -59,16 +59,16 @@ from astropy.io import fits
 from astropy.wcs import WCS
 
 from .io_readers import FiberSet
-from .geometry import (make_grid_from_points, fit_celestial_wcs, make_wcs3d,
-                       pixel_area_arcsec2)
-from .kernels import (build_projection_A, splat_cube, ivar_through_A,
-                      neff_from_A, coverage_from_A)
+from .geometry import pixel_area_arcsec2
+from .kernels import splat_cube, ivar_through_A, neff_from_A, coverage_from_A
+from .projection import prepare_grid, coverage_plateau
 
-# LVM science IFU geometry (Drory et al. 2024): 35.3" apertures on a 37" hex grid
-LVM_FIBER_DIAMETER_ARCSEC = 35.3
-LVM_FIBER_PITCH_ARCSEC = 37.0
-LVM_FILL_FACTOR = (np.pi * (LVM_FIBER_DIAMETER_ARCSEC / 2) ** 2
-                   / (np.sqrt(3) / 2 * LVM_FIBER_PITCH_ARCSEC ** 2))   # 0.8255
+# The LVM instrument facts now live in constants.py so that cube_build and
+# mapcat_build cannot disagree about them. Re-exported here because callers
+# and notebooks import LVM_FILL_FACTOR from this module.
+from .constants import (LVM_FIBER_DIAMETER_ARCSEC,      # noqa: F401
+                        LVM_FIBER_PITCH_ARCSEC,         # noqa: F401
+                        LVM_FILL_FACTOR)                # noqa: F401
 
 def build_map(
     fibers: FiberSet,
@@ -140,42 +140,24 @@ def build_map(
                      or None; written by save_map_to_fits as FIBERCAT
     """
 
-    # Scrub non-finite input. This matters more than it looks: the projection
-    # is a matrix multiply, so one NaN fiber flux propagates to EVERY pixel in
-    # that fiber's kernel support. DAP line fits fail on individual fibers
-    # routinely, and at fwhm=35" a few percent of bad fibers NaN out a fifth
-    # of the map. (cube_build.py has always done this; build_map did not.)
-    flux = np.nan_to_num(np.asarray(fibers.flux, float),
-                         nan=0.0, posinf=0.0, neginf=0.0)   # (K, N)
-    ivar = np.nan_to_num(np.asarray(fibers.ivar, float),
-                         nan=0.0, posinf=0.0, neginf=0.0)   # (K, N)
-    wave = np.asarray(fibers.wave, float)   # (N,)
-    x    = np.asarray(fibers.x_arcsec, float)
-    y    = np.asarray(fibers.y_arcsec, float)
-
-    # grid and mask
-    xg, yg, inside = make_grid_from_points(
-        x_arcsec=x,
-        y_arcsec=y,
+    # Shared setup: scrub, grid, A, WCS2D -- identical to what build_cube
+    # does, which is why it lives in projection.py rather than being written
+    # out twice. float64 here because L is a handful of emission lines, not
+    # ~12,000 spectral planes, so there is nothing to save by going narrower.
+    g = prepare_grid(
+        fibers,
         pixel_size_arcsec=pixel_size_arcsec,
-        fiber_radius_arcsec=fiber_radius_arcsec,
-    )
-
-    ny, nx = inside.shape
-
-    # build projection matrix A
-    A = build_projection_A(
-        x_arcsec=x,
-        y_arcsec=y,
-        xg=xg,
-        yg=yg,
-        inside_mask=inside,
         fwhm_arcsec=fwhm_arcsec,
         fiber_radius_arcsec=fiber_radius_arcsec,
         r_sigma_mult=r_sigma_mult,
-        mode=kernel_mode,
+        kernel_mode=kernel_mode,
+        wcs_strategy=wcs_strategy,
         max_dropped_frac=max_dropped_frac,
+        dtype=float,
     )
+    flux, ivar, wave = g["flux"], g["ivar"], g["wave"]
+    xg, yg, inside = g["xg"], g["yg"], g["inside"]
+    ny, nx, A = g["ny"], g["nx"], g["A"]
 
     # Forward project, get a cube shape (L, ny, nx)
     map_cube = splat_cube(flux, A, ny=ny, nx=nx)
@@ -208,10 +190,11 @@ def build_map(
     # Exact plateau value: sum_p coverage(p) == K, so the mean over the
     # footprint is K / N_inside. Derived from the data, not from the fibre
     # aperture or the grid spacing, so it stays correct for any bundle.
-    n_inside = int(np.count_nonzero(inside))
-    cov_plateau = (float(flux.shape[0]) / n_inside) if n_inside else float("nan")
+    # Derivation in projection.coverage_plateau.
+    cov_plateau = coverage_plateau(flux.shape[0], inside)
     with np.errstate(divide="ignore", invalid="ignore"):
-        coverage_norm = coverage / cov_plateau if n_inside else np.zeros_like(coverage)
+        coverage_norm = (coverage / cov_plateau if np.isfinite(cov_plateau)
+                         else np.zeros_like(coverage))
 
     # L=1 for a single emission line
     if map_cube.shape[0] == 1:
@@ -222,23 +205,10 @@ def build_map(
         emap = map_cube
         eivar = ivar_cube
 
-    # Fit 2D WCS.
-    # x0/y0 MUST be the grid origin: array element [0,0] sits at
-    # (xg[0], yg[0]), not at (0, 0) arcsec. Omitting them offsets the WCS
-    # from the array by about a third of a degree. See geometry.py.
-    wcs2d: Optional[WCS]
-    if wcs_strategy == "fit" and "ra_deg" in fibers.meta and "dec_deg" in fibers.meta:
-        wcs2d = fit_celestial_wcs(
-            x_arcsec=x,
-            y_arcsec=y,
-            ra_deg=np.asarray(fibers.meta["ra_deg"], float),
-            dec_deg=np.asarray(fibers.meta["dec_deg"], float),
-            pixel_size_arcsec=pixel_size_arcsec,
-            x0_arcsec=xg[0],
-            y0_arcsec=yg[0],
-        )
-    else:
-        wcs2d = None
+    # 2D WCS, already fitted by prepare_grid (which passes the grid origin
+    # x0/y0 -- omitting those offsets the WCS from the array by about a
+    # third of a degree; see geometry.py).
+    wcs2d: Optional[WCS] = g["wcs2d"]
 
     line_names = fibers.meta.get("line_names", None)
 
