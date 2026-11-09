@@ -75,6 +75,7 @@ pointings; for a single exposure, 5-8" already oversamples the beam.
 from __future__ import annotations
 from typing import Optional, Dict, Any
 
+import warnings
 import numpy as np
 from pathlib import Path as _Path
 from astropy.io import fits
@@ -354,7 +355,7 @@ def save_cube_to_fits(
     result: Dict[str, Any],
     path: str,
     extra_header: Optional[Dict[str, Any]] = None,
-    units: str = "flux_per_pixel",
+    units: str = "surface_brightness",
     inplace: bool = False,
     overwrite: bool = True,
 ) -> None:
@@ -375,21 +376,37 @@ def save_cube_to_fits(
 
     Parameters
     ----------
-    units : {"flux_per_pixel", "surface_brightness"}
-        What to WRITE. "flux_per_pixel" (default) stores the flux-conserving
-        quantity the projection produces, and read_cube converts on the way
-        back in. "surface_brightness" divides by the pixel solid angle before
-        writing, which is the better choice when the file is a catalog
-        product that other people (or other pixel scales) will consume: the
-        values no longer depend on the grid it happened to be built on. The
-        header records the choice in BUNIT and SBCONV, and read_cube refuses
-        to convert an already-converted file.
+    units : {"surface_brightness", "flux_per_pixel"}
+        What to WRITE. "surface_brightness" (DEFAULT) divides by the pixel
+        solid angle before writing, so the stored values do not depend on
+        the grid the cube happened to be built on -- the right choice for a
+        catalog product that other people, or other pixel scales, will
+        consume. "flux_per_pixel" stores the flux-conserving quantity the
+        projection produces, which is what you want if you are going to sum
+        pixels for total flux and nothing else.
+
+        The choice is recorded in BUNIT and SBCONV, so read_cube always
+        knows what it is looking at and never double-converts. Cubes written
+        before this default changed carry SBCONV=F (or no SBCONV at all) and
+        still read back correctly.
     inplace : bool
-        Only consulted when converting. False (default) converts a copy, so
-        `result` is left untouched; that copy is the same one the f4 cast
-        would make anyway. True divides the caller's arrays in place, which
-        MUTATES `result` -- use it when the cube is large enough that a
-        second copy is the difference between writing and swapping.
+        Only consulted when converting, i.e. for the default units now.
+        False (default) converts a copy, leaving `result` untouched. True
+        divides the caller's arrays in place, which MUTATES `result`.
+
+        This matters more than it used to. Converting needs an array the
+        caller does not own, so with units="surface_brightness" every save
+        allocates a second cube: a 2" cube with ~12,400 planes is ~82 GB in
+        float32, and the copy makes that ~164 GB. The usual pattern is
+
+            res = build_cube(...)
+            save_cube_to_fits(res, path, inplace=True)
+
+        where nothing reads `res["cube"]` afterwards, so the copy is pure
+        waste. Pass inplace=True there. Keep the default False when you go
+        on to use the in-memory cube, since otherwise its values silently
+        become surface brightness while your code still treats them as flux.
+        save_cube_to_fits warns when it is about to make a large copy.
     """
     if units not in ("flux_per_pixel", "surface_brightness"):
         raise ValueError("units must be 'flux_per_pixel' or "
@@ -447,6 +464,19 @@ def save_cube_to_fits(
             "pixel_size_arcsec in the result."
         )
 
+    # Converting requires an array the caller does not own, so inplace=False
+    # allocates a second cube. Say so when that is expensive rather than
+    # letting the machine start swapping with no explanation.
+    if want_sb and not inplace:
+        gb = np.asarray(cube).nbytes / 1024 ** 3
+        if gb > 2.0:
+            warnings.warn(
+                f"save_cube_to_fits is copying a {gb:.1f} GB cube to convert "
+                f"it to surface brightness (peak ~{2*gb:.1f} GB). Pass "
+                f"inplace=True if nothing reads result['cube'] after this "
+                f"call -- it converts in place and MUTATES result.",
+                RuntimeWarning, stacklevel=2)
+
     cube_out = np.asarray(cube).astype("f4", copy=(want_sb and not inplace))
     ivar_out = np.asarray(ivar).astype("f4", copy=(want_sb and not inplace))
     if want_sb:
@@ -497,8 +527,16 @@ def save_cube_to_fits(
     if cov_plateau is not None and np.isfinite(cov_plateau):
         ch["COVPLATE"] = (float(cov_plateau),
                           "mean coverage over footprint = K/N_inside")
-        ch["COVNOTE"] = ("COVERAGE/COVPLATE ~ 1 on the interior",
-                         "threshold on that, not on COVERAGE")
+        for _ln in (
+            "COVERAGE is the row sum of the projection matrix A. Because the",
+            "columns of A sum to 1, sum_p COVERAGE(p) == K exactly, so its mean",
+            "over the footprint is COVPLATE = K/N_inside (~0.19 for 15in pixels,",
+            "NOT ~1) and its maximum moves with the kernel width. It is not a",
+            "fraction and has no fixed ceiling: a cut like COVERAGE > 0.3 masks",
+            "the entire map. Threshold on COVERAGE/COVPLATE, which is ~1 on the",
+            "well-sampled interior for any pixel size and kernel, or on NEFF.",
+        ):
+            ch.add_comment(_ln)
 
     # Which mask said which fibers were usable.
     mi = result.get("mask_info") or {}

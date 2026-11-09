@@ -663,8 +663,16 @@ def save_map_to_fits(
     if cov_plateau is not None and np.isfinite(cov_plateau):
         map_hdu.header["COVPLATE"] = (float(cov_plateau),
                                       "mean coverage over footprint = K/N_inside")
-        map_hdu.header["COVNOTE"] = ("COVERAGE/COVPLATE ~ 1 on the interior",
-                                     "threshold on that, not on COVERAGE")
+        for _ln in (
+            "COVERAGE is the row sum of the projection matrix A. Because the",
+            "columns of A sum to 1, sum_p COVERAGE(p) == K exactly, so its mean",
+            "over the footprint is COVPLATE = K/N_inside (~0.19 for 15in pixels,",
+            "NOT ~1) and its maximum moves with the kernel width. It is not a",
+            "fraction and has no fixed ceiling: a cut like COVERAGE > 0.3 masks",
+            "the entire map. Threshold on COVERAGE/COVPLATE, which is ~1 on the",
+            "well-sampled interior for any pixel size and kernel, or on NEFF.",
+        ):
+            map_hdu.header.add_comment(_ln)
 
     # Fill provenance, written whether or not any fiber was imputed --
     # FILLED=F is information,
