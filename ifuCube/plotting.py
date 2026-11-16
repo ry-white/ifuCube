@@ -116,8 +116,8 @@ def good_pixels(result: Dict[str, Any], min_coverage: float = 0.5,
 # ---------------------------------------------------------------------------
 
 def show_map(data, wcs=None, ax=None, label="", title=None, pct=(1, 99.5),
-             log=False, stretch=None, mask=None, cmap="inferno", grid=True,
-             colorbar=True, east_left=True, **kw):
+             log=False, stretch=None, mask=None, footprint=None,
+             cmap="inferno", grid=True, colorbar=True, east_left=True, **kw):
     """
     One 2D plane with an optional WCS grid, percentile stretch and colorbar.
 
@@ -158,6 +158,12 @@ def show_map(data, wcs=None, ax=None, label="", title=None, pct=(1, 99.5),
         not by thresholding raw coverage -- `coverage > 0.3` masks
         everything, because the mean of coverage is K/N_inside (~0.19 at
         15"), not ~1.
+    footprint : (ny, nx) bool array, optional
+        Outline this region. Pass result["inside"] whenever `mask` has
+        removed pixels for a quality reason: without the outline a reader
+        cannot tell sky that was never observed from sky that was observed
+        but failed the cut, and a ragged mask boundary then reads as broken
+        data rather than as a deliberate threshold.
     colorbar : bool
         Attach one. Set False when you are managing a shared colorbar.
     east_left : bool
@@ -243,6 +249,15 @@ def show_map(data, wcs=None, ax=None, label="", title=None, pct=(1, 99.5),
     # origin="lower" ALWAYS -- see the module docstring. Without it the
     # no-WCS path is flipped vertically while the WCS path is not.
     im = ax.imshow(d, cmap=cmap, origin="lower", **kw)
+
+    if footprint is not None:
+        fp = np.asarray(footprint, bool)
+        if fp.shape != d.shape:
+            raise ValueError(f"footprint shape {fp.shape} != data shape {d.shape}")
+        # One contour at the half level traces the boundary of the boolean
+        # region without filling it.
+        ax.contour(fp.astype(float), levels=[0.5], colors="0.35",
+                   linewidths=0.8, linestyles="-")
 
     if colorbar:
         # ax.figure.colorbar, not plt.colorbar: the latter goes through the
