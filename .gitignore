@@ -1,6 +1,9 @@
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
 .venv/
 venv/
 
@@ -12,3 +15,10 @@ venv/
 
 # Editor/environment
 .env
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Build outputs
+mapcats/
+cubes/

@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ifuCube"
+version = "0.1.0"
+description = "Flux-conserving cubes, emission-line maps and mosaics from fibre IFU data"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Ryder White" }]
+keywords = ["astronomy", "IFU", "spectroscopy", "LVM", "SDSS"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+# Only what every build needs. Everything else is an extra below, because a
+# machine that builds cubes and writes FITS should not have to install a
+# plotting stack or a reprojection library it never calls.
+dependencies = [
+    "numpy>=1.20",
+    "scipy>=1.7",
+    "astropy>=5.0",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.5"]
+healpix = ["astropy-healpix>=0.7"]
+mosaic = ["reproject>=0.9"]
+# Readers for LVM products. NOTE: io_lvm also needs `lvmdap`, which is not on
+# PyPI -- install it from the SDSS source separately.
+lvm = ["polars>=0.19", "pyyaml>=6.0"]
+# Everything that is pip-installable, for a workstation.
+all = [
+    "matplotlib>=3.5",
+    "astropy-healpix>=0.7",
+    "reproject>=0.9",
+    "polars>=0.19",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/ry-white/ifuCube"
+
+[tool.setuptools]
+# Named explicitly rather than auto-discovered: `notebooks` sits next to the
+# package and auto-discovery would try to treat it as one.
+packages = ["ifuCube"]

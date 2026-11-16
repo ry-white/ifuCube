@@ -46,6 +46,21 @@ Afterwards:
 
 The two builders can also be run from the command line.
 
+## Layout
+
+The package itself lives in the `ifuCube` directory. A worked tutorial on the
+Helix Nebula, from downloading the data through to coverage-corrected
+photometry, is in `notebooks`. It runs on the public LVM preview released with
+SDSS DR20, and its second section fetches the data for you, so there is nothing
+to arrange beforehand.
+
+## Installing
+
+Clone the repository and, from its root, install it in editable mode with
+`pip install -e .` — after that the package imports from anywhere, and changes
+to the source take effect without reinstalling. The optional dependency groups
+below can be added with `pip install -e ".[all]"`.
+
 ## Requirements
 
 NumPy, SciPy and Astropy are needed. Reading LVM files additionally needs polars, PyYAML and the LVM DAP package, which is not on PyPI. Plotting needs matplotlib, the HEALPix step needs astropy-healpix, and mosaicking needs reproject. All of these are imported only where they are used, so a machine that just builds cubes and writes FITS does not need a plotting stack.
