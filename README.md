@@ -63,11 +63,17 @@ below can be added with `pip install -e ".[all]"`.
 
 ## Requirements
 
-NumPy, SciPy and Astropy are needed. Reading LVM files additionally needs polars, PyYAML and the LVM DAP package, which is not on PyPI. Plotting needs matplotlib, the HEALPix step needs astropy-healpix, and mosaicking needs reproject. All of these are imported only where they are used, so a machine that just builds cubes and writes FITS does not need a plotting stack.
+NumPy, SciPy and Astropy are needed. Reading LVM files additionally needs polars and PyYAML, and reading DAP files in particular needs the LVM DAP package, which is not on PyPI — install it with `pip install --no-deps git+https://github.com/sdss/lvmdap.git`. Use `--no-deps`, because it pins an exact older matplotlib and pulls a long chain of fitting libraries the file reader does not use. Nothing else in the package needs it: reduced spectra, building, filling, diagnostics and plotting all work without it. Plotting needs matplotlib, the HEALPix step needs astropy-healpix, and mosaicking needs reproject. All of these are imported only where they are used, so a machine that just builds cubes and writes FITS does not need a plotting stack.
 
 ## Known issues
 
 A footprint centroid is computed as a plain mean of longitudes in the HEALPix crossmatch, which is wrong for a field straddling RA = 0. The mosaic coadd reopens every input file once per wavelength plane, which is far more reads than necessary and worth fixing before running a large mosaic.
+
+## Licence
+
+MIT, so you are free to use, modify and redistribute it, including in your own
+pipeline. If it is useful in published work, `CITATION.cff` gives a citation and
+GitHub's "Cite this repository" button will format it for you.
 
 ## Reference
 

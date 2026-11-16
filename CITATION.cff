@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "ifuCube: flux-conserving cubes and emission-line maps from fibre IFU data"
+abstract: >-
+  A Python pipeline that turns row-stacked fibre spectra into strictly
+  flux-conserving data cubes and emission-line maps, written for the SDSS-V
+  Local Volume Mapper but applicable to any fibre IFU.
+type: software
+authors:
+  - family-names: White
+    given-names: Ryder
+version: 0.1.0
+date-released: "2026-11-16"
+license: MIT
+repository-code: "https://github.com/ry-white/ifuCube"
+keywords:
+  - astronomy
+  - integral field spectroscopy
+  - IFU
+  - SDSS
+  - Local Volume Mapper
+references:
+  - type: article
+    title: "The SDSS-V Local Volume Mapper (LVM): Scientific Motivation and Project Overview"
+    authors:
+      - family-names: Drory
+        given-names: Niv
+    year: 2024
+    journal: "The Astronomical Journal"
+    volume: 168
+    start: 198

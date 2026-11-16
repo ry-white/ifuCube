@@ -92,9 +92,43 @@ import numpy as np
 from astropy.io import fits
 import polars as pl
 
-from lvmdap.dap_tools import read_DAP_file
 from .geometry import radec_to_tangent_arcsec
 from .io_readers import FiberSet
+
+
+def read_DAP_file(dap_path, verbose: bool = False):
+    """Read an LVM-DAP file into an astropy Table, via lvmdap.
+
+    Thin wrapper whose only job is the import. lvmdap is NOT on PyPI, so
+    `pip install -e .` cannot pull it and it is not declared as a dependency.
+    Importing it at module scope meant that a missing lvmdap stopped the whole
+    module loading -- including read_lvm_sframe, which does not need it -- and
+    the failure surfaced as a bare ModuleNotFoundError from line 95 with no
+    indication of what to install. Deferring it here means only the DAP
+    readers require it, and the error says what to do.
+
+    Reimplementing it is not an option worth taking: read_DAP_file merges PT,
+    RSP, COEFFS, PM_ELINES, NP_ELINES and several optional extensions, and
+    switches on the primary header's DAP_VER between two incompatible
+    layouts. A local copy would drift from the format silently.
+    """
+    try:
+        from lvmdap.dap_tools import read_DAP_file as _read
+    except ImportError as exc:
+        raise ImportError(
+            "reading DAP files needs the `lvmdap` package, which is not on "
+            "PyPI and so is not installed by `pip install -e .`.\n\n"
+            "    pip install --no-deps git+https://github.com/sdss/lvmdap.git\n\n"
+            "Use --no-deps: lvmdap pins matplotlib==3.7.3 exactly and pulls "
+            "pyPipe3D, specutils, emcee, PyAstronomy and lmfit, none of which "
+            "read_DAP_file needs -- its pyFIT3D is vendored inside lvmdap "
+            "itself, so numpy, scipy, astropy, matplotlib and packaging are "
+            "enough.\n\n"
+            "Nothing else in ifuCube requires lvmdap: read_lvm_sframe, the "
+            "builders, fill, diagnostics and plotting all work without it."
+        ) from exc
+    return _read(dap_path, verbose=verbose) if verbose else _read(dap_path)
+
 
 # name : (flux_col, err_col, rest_wavelength_A)
 # Module level so build.py and friends can validate --lines against it and
