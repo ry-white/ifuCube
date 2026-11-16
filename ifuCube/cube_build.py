@@ -481,6 +481,25 @@ def save_cube_to_fits(
     ivar_out = np.asarray(ivar).astype("f4", copy=(want_sb and not inplace))
     if want_sb:
         cube_out /= np.float32(pix_area)            # flux/pixel -> flux/arcsec**2
+
+        # IVAR scales as area**2, and at 9" pixels that is a factor of 6561 --
+        # enough to push a large float32 ivar past 3.4e38 and silently become
+        # inf. An inf ivar reads as zero uncertainty, which is worse than a
+        # capped one, so clip the input to what can survive the multiply
+        # rather than letting it overflow. Done in place and in float32: the
+        # obvious alternative, casting the whole cube to float64, would
+        # double peak memory on an array that is already gigabytes.
+        _lim = np.float32(np.finfo(np.float32).max / (float(pix_area) ** 2))
+        _n_capped = int(np.count_nonzero(ivar_out > _lim))
+        if _n_capped:
+            np.minimum(ivar_out, _lim, out=ivar_out)
+            warnings.warn(
+                f"{_n_capped:,} IVAR values ({100*_n_capped/ivar_out.size:.3g}%) "
+                f"would overflow float32 when scaled by PIXAR_A2**2 = "
+                f"{float(pix_area)**2:.6g}; capped at {float(_lim):.3e} rather "
+                "than allowed to become inf. These are pixels the projection "
+                "gave near-zero variance, usually where a single fibre "
+                "dominates.", RuntimeWarning, stacklevel=2)
         ivar_out *= np.float32(pix_area) ** 2       # Var scales as area**2
         flux_header["BUNIT"] = ("flux/arcsec**2",
                                 "surface brightness: FLUX / PIXAR_A2")

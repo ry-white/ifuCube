@@ -31,8 +31,10 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 import numpy as np
+import warnings
+
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
+from matplotlib.colors import AsinhNorm, LogNorm
 
 
 __all__ = ["show_map", "show_planes", "show_fibers", "show_wave",
@@ -114,8 +116,8 @@ def good_pixels(result: Dict[str, Any], min_coverage: float = 0.5,
 # ---------------------------------------------------------------------------
 
 def show_map(data, wcs=None, ax=None, label="", title=None, pct=(1, 99.5),
-             log=False, mask=None, cmap="inferno", grid=True, colorbar=True,
-             east_left=True, **kw):
+             log=False, stretch=None, mask=None, cmap="inferno", grid=True,
+             colorbar=True, east_left=True, **kw):
     """
     One 2D plane with an optional WCS grid, percentile stretch and colorbar.
 
@@ -132,7 +134,25 @@ def show_map(data, wcs=None, ax=None, label="", title=None, pct=(1, 99.5),
         Percentile clip for the colour limits, computed over finite pixels
         only (and over positive pixels only when log=True).
     log : bool
-        LogNorm, using positive values only.
+        Shorthand for stretch="log". Kept for compatibility.
+    stretch : {"linear", "log", "asinh"}, optional
+        How to map values to colour. Overrides `log` when given.
+
+        "log" MASKS every non-positive pixel -- matplotlib's LogNorm cannot
+        place them, so they render as the axes background and look like holes
+        in the data. On an emission-line map that is a trap rather than a
+        nicety: line fits in the faint outskirts scatter about zero and a
+        good fraction come out slightly negative, so the holes appear exactly
+        where the signal is weakest, and worst in the faintest line. Nothing
+        is missing from the map.
+
+        "asinh" is the fix, and the usual astronomical answer. It is linear
+        near zero and logarithmic at large values, so it spans the same
+        dynamic range while placing negative pixels instead of discarding
+        them. Prefer it over "log" for anything with noise near zero.
+
+        show_map counts the non-positive pixels before applying "log" and
+        warns if they are more than 1% of the field.
     mask : (ny, nx) bool array, optional
         True where the pixel should be SHOWN. Build it with good_pixels(),
         not by thresholding raw coverage -- `coverage > 0.3` masks
@@ -182,12 +202,35 @@ def show_map(data, wcs=None, ax=None, label="", title=None, pct=(1, 99.5),
             "raw-coverage threshold: use good_pixels(result, 0.5) instead of "
             "result['coverage'] > 0.3.")
 
-    if log:
+    if stretch is None:
+        stretch = "log" if log else "linear"
+    if stretch not in ("linear", "log", "asinh"):
+        raise ValueError(f"stretch must be linear, log or asinh, got {stretch!r}")
+
+    if stretch == "log":
         pos = finite[finite > 0]
         if pos.size == 0:
-            raise ValueError("log=True but no positive values")
+            raise ValueError("stretch='log' but no positive values")
+        n_bad = finite.size - pos.size
+        if n_bad > 0.01 * finite.size:
+            warnings.warn(
+                f"{n_bad:,} of {finite.size:,} pixels "
+                f"({100*n_bad/finite.size:.1f}%) are <= 0 and a log stretch "
+                "cannot place them, so they will render as blank holes -- "
+                "usually in the faint outskirts, where line fits scatter "
+                "about zero. The data is intact. Pass stretch='asinh' to "
+                "show them.", RuntimeWarning, stacklevel=2)
         vmin, vmax = np.percentile(pos, pct)
         kw["norm"] = LogNorm(vmin=max(vmin, pos.min()), vmax=vmax)
+    elif stretch == "asinh":
+        vmin, vmax = np.percentile(finite, pct)
+        # Soften around the noise: linear below roughly the positive 25th
+        # percentile, logarithmic above it.
+        pos = finite[finite > 0]
+        lin = float(np.percentile(pos, 25)) if pos.size else 1.0
+        span = max(vmax - vmin, 1e-30)
+        kw["norm"] = AsinhNorm(linear_width=max(lin, span * 1e-3),
+                               vmin=vmin, vmax=vmax)
     else:
         kw.setdefault("vmin", np.percentile(finite, pct[0]))
         kw.setdefault("vmax", np.percentile(finite, pct[1]))
