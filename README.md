@@ -12,7 +12,7 @@ This is a deposition, not an interpolation. The value in a pixel answers "how mu
 
 ## Units and conventions
 
-Cubes are stored as surface brightness, in flux per square arcsecond, so the values do not depend on the pixel size the cube happened to be built with. Maps are stored as flux per pixel, the conserving quantity, and the readers convert on the way back in. The headers record which convention a file uses, so nothing has to be guessed and no file is ever converted twice.
+Cubes and maps are both stored as surface brightness, in flux per square arcsecond, so the values on disk do not depend on the pixel size they happened to be built with. The flux-conserving quantity, flux per pixel, is what the builders produce in memory and what you sum for photometry; the savers convert on the way out and the readers give back whichever you ask for. Velocity and dispersion maps are intensive and are never area-converted. The headers record which case a file is, so nothing has to be guessed and no file is ever converted twice.
 
 Maps and cubes come out in the standard sky orientation, North up and East left.
 

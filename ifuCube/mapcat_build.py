@@ -14,7 +14,13 @@ Wires together:
 
 Units of the output -- read this before comparing map values
 -------------------------------------------------------------
-The FLUX image is stored as *flux per pixel* (BUNIT = 'flux/pixel').
+The FLUX image is stored as *surface brightness* (BUNIT = 'flux/arcsec**2',
+SBCONV = T) by default, matching cube_build; pass units="flux_per_pixel" to
+save_map_to_fits to store the flux-conserving quantity instead. Either way
+read_map returns whichever you ask for, keyed off SBCONV. The rest of this
+note describes the two quantities and why both exist.
+
+Flux per pixel is what the projection produces (BUNIT = 'flux/pixel').
 
 Why: the projection is flux-conserving. Each fiber's measured flux is shared
 out over nearby pixels with weights that sum to 1, so summing the pixels of
@@ -524,9 +530,30 @@ def save_map_to_fits(
     path: str,
     extra_header: Optional[Dict[str, Any]] = None,
     overwrite: bool = True,
+    units: str = "surface_brightness",
 ) -> None:
     """
     Save an emission-line map result (from build_map) into a FITS file.
+
+    Units
+    -----
+    units : {"surface_brightness", "flux_per_pixel"}
+        What to WRITE for a flux map. "surface_brightness" (DEFAULT, matching
+        save_cube_to_fits) divides FLUX by the pixel solid angle and scales
+        IVAR by its square, so the stored values do not depend on the grid
+        the map was built on. "flux_per_pixel" stores the flux-conserving
+        quantity the projection produces -- sum pixels for total flux.
+
+        The choice is recorded in BUNIT and SBCONV, and read_map keys off
+        SBCONV, so a file is never converted twice and maps written before
+        this default changed (SBCONV=F, or absent) still read correctly.
+
+        KINEMATIC MAPS ARE NEVER CONVERTED. A result from build_kinematic_map
+        carries a "quantity" key, and dividing a velocity or a dispersion by
+        a pixel area is meaningless. Such a result is written as-is with
+        BUNIT km/s (vel) or Angstrom (disp) and SBCONV=F, whatever `units`
+        says. This is the one way the map saver differs from the cube saver:
+        a cube is always flux, a map result may not be.
 
     Layout
     ======
@@ -587,29 +614,82 @@ def save_map_to_fits(
         ps = result.get("pixel_size_arcsec", None)
         pix_area = float(ps) ** 2 if ps else None
 
-    # Record the units convention. These two keywords are what let the
-    # HEALPix binning (or any other averaging step) convert to surface
-    # brightness instead of silently inheriting this pixel size.
-    map_hdr["BUNIT"] = ("flux/pixel", "flux-conserving: amount per output pixel")
+    if units not in ("surface_brightness", "flux_per_pixel"):
+        raise ValueError(f"units must be 'surface_brightness' or "
+                         f"'flux_per_pixel', got {units!r}")
+
+    # A kinematic result (build_kinematic_map) is intensive and must never
+    # be area-converted. It announces itself with a "quantity" key.
+    quantity = result.get("quantity")
+    is_kinematic = quantity is not None
+    want_sb = (units == "surface_brightness") and not is_kinematic
+
+    if want_sb and pix_area is None:
+        raise ValueError(
+            "units='surface_brightness' needs a pixel area, but the result "
+            "has no WCS and no pixel_size_arcsec; pass units='flux_per_pixel'")
+
+    # Convert on COPIES. Maps are a handful of planes, not ~12,000, so unlike
+    # save_cube_to_fits there is nothing to gain from an in-place option and
+    # the caller's result is left exactly as built.
+    if want_sb:
+        M = M / pix_area
+        IV = IV * pix_area ** 2
+
     if pix_area is not None:
         map_hdr["PIXAR_A2"] = (pix_area, "pixel solid angle [arcsec**2]")
-    map_hdr["FLUXCONS"] = (True, "columns of projection matrix A sum to 1")
+    map_hdr["FLUXCONS"] = (not is_kinematic,
+                           "columns of projection matrix A sum to 1")
     map_hdr["APERFILL"] = (round(float(LVM_FILL_FACTOR), 4),
                            "LVM fiber aperture fill factor, see COMMENT")
-    for line in (
-        "FLUX is flux PER PIXEL (flux-conserving: summing pixels gives the",
-        "total flux). Values scale with pixel area, so to compare maps with",
-        "different pixel sizes, or to average pixels, convert first:",
-        "  surface brightness [flux/arcsec**2] = FLUX / PIXAR_A2",
-        "  its inverse variance                = IVAR * PIXAR_A2**2",
-        "Fibers cover APERFILL of the sky (35.3in apertures, 37in hex grid);",
-        "divide surface brightness by APERFILL for true sky brightness.",
-        "ifuCube.mapcat_build.read_map() applies both conversions.",
-    ):
-        map_hdr.add_comment(line)
 
-    ivar_hdr = map_hdr.copy()
-    ivar_hdr["BUNIT"] = ("1/(flux/pixel)**2", "inverse variance of FLUX")
+    if is_kinematic:
+        unit_str = {"vel": "km/s", "disp": "Angstrom"}.get(str(quantity),
+                                                            str(quantity))
+        map_hdr["BUNIT"] = (unit_str, f"weighted-average {quantity}; intensive")
+        map_hdr["SBCONV"] = (False, "intensive quantity: never area-converted")
+        map_hdr["KINEMAT"] = (True, "from build_kinematic_map, not build_map")
+        for line in (
+            f"This is a {quantity} map: a WEIGHTED AVERAGE over fibers, not a",
+            "flux deposition. Do not divide by PIXAR_A2 and do not sum pixels.",
+            "NEFF here is the Kish effective fiber count on the same weights.",
+        ):
+            map_hdr.add_comment(line)
+        ivar_hdr = map_hdr.copy()
+        ivar_hdr["BUNIT"] = (f"1/({unit_str})**2", "inverse variance of FLUX")
+    elif want_sb:
+        map_hdr["BUNIT"] = ("flux/arcsec**2",
+                            "surface brightness: FLUX / PIXAR_A2")
+        map_hdr["SBCONV"] = (True, "T if already divided by PIXAR_A2")
+        for line in (
+            "FLUX is SURFACE BRIGHTNESS, flux per arcsec**2: already divided",
+            "by PIXAR_A2, so values do not depend on the pixel size. To get",
+            "the flux-conserving quantity back, multiply by PIXAR_A2 (and",
+            "divide IVAR by PIXAR_A2**2); then summing pixels gives total",
+            "flux. read_map(units='flux_per_pixel') does this.",
+            "Fibers cover APERFILL of the sky (35.3in apertures, 37in hex grid);",
+            "divide by APERFILL for true sky brightness.",
+        ):
+            map_hdr.add_comment(line)
+        ivar_hdr = map_hdr.copy()
+        ivar_hdr["BUNIT"] = ("1/(flux/arcsec**2)**2", "inverse variance of FLUX")
+        ivar_hdr["SBCONV"] = (True, "T if already multiplied by PIXAR_A2**2")
+    else:
+        map_hdr["BUNIT"] = ("flux/pixel", "flux-conserving: amount per output pixel")
+        map_hdr["SBCONV"] = (False, "T if already divided by PIXAR_A2")
+        for line in (
+            "FLUX is flux PER PIXEL (flux-conserving: summing pixels gives the",
+            "total flux). Values scale with pixel area, so to compare maps with",
+            "different pixel sizes, or to average pixels, convert first:",
+            "  surface brightness [flux/arcsec**2] = FLUX / PIXAR_A2",
+            "  its inverse variance                = IVAR * PIXAR_A2**2",
+            "Fibers cover APERFILL of the sky (35.3in apertures, 37in hex grid);",
+            "divide surface brightness by APERFILL for true sky brightness.",
+            "ifuCube.mapcat_build.read_map() applies both conversions.",
+        ):
+            map_hdr.add_comment(line)
+        ivar_hdr = map_hdr.copy()
+        ivar_hdr["BUNIT"] = ("1/(flux/pixel)**2", "inverse variance of FLUX")
     aux_hdr = wcs2d.to_header(relax=True) if wcs2d is not None else fits.Header()
 
     map_hdu = fits.ImageHDU(M.astype("f4"), header=map_hdr, name="FLUX")
@@ -751,10 +831,15 @@ def read_map(
     path : str
         Map FITS file.
     units : {"surface_brightness", "flux_per_pixel"}
-        "surface_brightness" (default): FLUX / PIXAR_A2, in flux/arcsec**2.
-        Independent of the pixel size the map was built with, so maps built
-        with different settings can be compared pixel by pixel.
-        "flux_per_pixel": the stored values; sum pixels for total flux.
+        What you want BACK, whatever is on disk. The header's SBCONV says
+        which the file holds, and the conversion is applied or undone
+        accordingly -- so a surface-brightness file is never divided twice,
+        and a flux/pixel file from before the default changed converts once.
+        "surface_brightness" (default): flux/arcsec**2, independent of the
+        pixel size, so maps built with different settings compare directly.
+        "flux_per_pixel": the conserving quantity; sum pixels for total flux.
+        Kinematic maps (BUNIT km/s or Angstrom) are intensive and come back
+        exactly as stored regardless.
     correct_fill_factor : bool
         Also divide by APERFILL (~0.83), so smooth emission matches the true
         sky surface brightness. Only valid with units="surface_brightness".
@@ -794,25 +879,42 @@ def read_map(
         data = data[0]
         ivar = ivar[0] if ivar is not None else None
 
-    bunit = str(hdr.get("BUNIT", "flux/pixel"))
-    if units == "surface_brightness":
-        if bunit != "flux/pixel":
-            raise ValueError(f"{hdu} has BUNIT={bunit!r}, not 'flux/pixel'; "
-                             "use units='flux_per_pixel' to read it as stored")
-        area = float(hdr.get("PIXAR_A2", pixel_area_arcsec2(wcs2d)))
-        data = data / area
-        ivar = ivar * area ** 2 if ivar is not None else None
-        bunit = "flux/arcsec**2"
-        if correct_fill_factor:
-            fill = float(hdr.get("APERFILL", LVM_FILL_FACTOR))
-            data = data / fill
-            ivar = ivar * fill ** 2 if ivar is not None else None
-            bunit += " (aperture-fill corrected)"
-    elif units == "flux_per_pixel":
-        if correct_fill_factor:
-            raise ValueError("correct_fill_factor needs units='surface_brightness'")
-    else:
+    if units not in ("surface_brightness", "flux_per_pixel"):
         raise ValueError(f"units must be 'surface_brightness' or 'flux_per_pixel', got {units!r}")
+
+    bunit = str(hdr.get("BUNIT", "flux/pixel"))
+    # SBCONV says what is on disk. Files written before the saver recorded it
+    # are flux/pixel, so the default is False -- that is what keeps old maps
+    # reading correctly after the default changed.
+    stored_sb = bool(hdr.get("SBCONV", False))
+    is_kinematic = bool(hdr.get("KINEMAT", False)) or bunit in ("km/s", "Angstrom")
+
+    if is_kinematic:
+        # A velocity or dispersion map. Intensive: there is no per-pixel or
+        # per-arcsec**2 version of it, so `units` does not apply. Returned
+        # exactly as stored, BUNIT carried through.
+        if correct_fill_factor:
+            raise ValueError("correct_fill_factor is meaningless for a "
+                             f"kinematic map (BUNIT={bunit!r})")
+    else:
+        area = float(hdr.get("PIXAR_A2", pixel_area_arcsec2(wcs2d)))
+        if units == "surface_brightness":
+            if not stored_sb:
+                data = data / area
+                ivar = ivar * area ** 2 if ivar is not None else None
+            bunit = "flux/arcsec**2"
+            if correct_fill_factor:
+                fill = float(hdr.get("APERFILL", LVM_FILL_FACTOR))
+                data = data / fill
+                ivar = ivar * fill ** 2 if ivar is not None else None
+                bunit += " (aperture-fill corrected)"
+        else:  # flux_per_pixel
+            if correct_fill_factor:
+                raise ValueError("correct_fill_factor needs units='surface_brightness'")
+            if stored_sb:
+                data = data * area
+                ivar = ivar / area ** 2 if ivar is not None else None
+            bunit = "flux/pixel"
 
     # Which plane is which. Without this the caller holds an (N, ny, nx) cube
     # and no way to index it except by position -- and reordering --lines once
@@ -855,10 +957,10 @@ def main(argv=None) -> int:
         prog="python -m ifuCube.mapcat_build",
         description="Build flux-conserving emission-line maps, and "
                     "optionally kinematic maps, from an LVM DAP file.",
-        epilog="Maps are written as flux PER PIXEL (summing pixels gives "
-               "total flux); read_map() converts to surface brightness on "
-               "the way back in. Threshold on COVERAGE/COVPLATE, never on "
-               "raw COVERAGE.",
+        epilog="Maps are written as surface brightness by default, like "
+               "cubes; --units flux_per_pixel keeps the conserving quantity. "
+               "read_map() returns whichever you ask for. Threshold on "
+               "COVERAGE/COVPLATE, never on raw COVERAGE.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     ap.add_argument("--dap", required=True, metavar="FITS",
@@ -883,6 +985,15 @@ def main(argv=None) -> int:
                         "file itself, whose PT extension carries one")
 
     add_grid_args(ap)
+
+    g = ap.add_argument_group("map output")
+    g.add_argument("--units", choices=["surface_brightness", "flux_per_pixel"],
+                   default="surface_brightness",
+                   help="units to WRITE for flux maps. surface_brightness "
+                        "divides by the pixel solid angle so values do not "
+                        "depend on the grid; flux_per_pixel keeps the "
+                        "conserving quantity. Kinematic maps are never "
+                        "converted either way.")
 
     g = ap.add_argument_group("kinematic maps")
     g.add_argument("--kinematics", nargs="+", default=None,
@@ -927,9 +1038,10 @@ def main(argv=None) -> int:
         from .diagnostics import run_all_checks
         run_all_checks(result)
 
-    save_map_to_fits(result, args.output, overwrite=overwrite)
+    save_map_to_fits(result, args.output, overwrite=overwrite, units=args.units)
     if verbose:
-        print(f"[map] wrote {args.output}  lines={result.get('line_names')}")
+        print(f"[map] wrote {args.output}  lines={result.get('line_names')}  "
+              f"({args.units})")
 
     for qty in (args.kinematics or []):
         kin = build_kinematic_map(result, quantity=qty,
