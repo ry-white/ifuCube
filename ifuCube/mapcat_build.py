@@ -238,6 +238,7 @@ def build_map(
         fibermask=fibers.meta.get("fibermask"),
         mask_info=fibers.meta.get("mask_info"),
         fill_info=fibers.meta.get("fill_info"),
+        kinematics_source=fibers.meta.get("kinematics_source"),
     )
 
 _KIN_ALIASES = {
@@ -522,6 +523,7 @@ def build_kinematic_map(
         pixel_size_arcsec=result.get("pixel_size_arcsec"),
         fibercat=None, fibermask=None, mask_info=result.get("mask_info"),
         fill_info=result.get("fill_info"),
+        kinematics_source=result.get("kinematics_source"),
     )
 
 
@@ -649,6 +651,10 @@ def save_map_to_fits(
         map_hdr["BUNIT"] = (unit_str, f"weighted-average {quantity}; intensive")
         map_hdr["SBCONV"] = (False, "intensive quantity: never area-converted")
         map_hdr["KINEMAT"] = (True, "from build_kinematic_map, not build_map")
+        ksrc = result.get("kinematics_source")
+        if ksrc:
+            map_hdr["KINSRC"] = (str(ksrc)[:8],
+                                 "DAP estimator: pek/pe parametric, np moments")
         for line in (
             f"This is a {quantity} map: a WEIGHTED AVERAGE over fibers, not a",
             "flux deposition. Do not divide by PIXAR_A2 and do not sum pixels.",

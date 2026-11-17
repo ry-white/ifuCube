@@ -85,6 +85,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Sequence
 import fnmatch
+import re
 import warnings
 
 import yaml
@@ -154,6 +155,71 @@ LINE_DEFS = {
 #     list_dap_columns(path, "*Halpha*")
 KINEMATIC_PREFIXES = ("vel", "e_vel", "disp", "e_disp")
 
+# The DAP measures each line's kinematics more than one way, and the
+# estimates are NOT interchangeable. In order of preference:
+#
+#   "pek"  second-pass parametric fit (PM_KEL, or PEK_ELINES_{B,R,I} from
+#          DAP_VER 2.0.0). A Gaussian fit, refined after a first pass. This
+#          is what the LVM Helix paper (Sanchez et al. 2026, fig. 6) maps.
+#   "pe"   first-pass parametric fit (PM_ELINES, or PM_ELINES_{B,R,I}).
+#   "np"   non-parametric moments (NP_ELINES_{B,R,I}): a flux-weighted
+#          centroid and width inside a fixed wavelength window. Always
+#          present, and fine for FLUX, but a poorer velocity estimator at
+#          low signal-to-noise -- noise and continuum drag the centroid
+#          toward the window centre, compressing the velocity field toward
+#          the reference the window was placed on.
+#
+# Fluxes are always read from the non-parametric columns via LINE_DEFS;
+# only the kinematics follow this choice.
+KINEMATIC_SOURCES = ("pek", "pe", "np")
+
+
+def _kin_candidates(prefix: str, stem: str, source: str) -> list:
+    """
+    Every column name that `source` could use for `prefix` on this line.
+
+    Two DAP layouts exist. In the wide layout (DAP_VER >= 2.0.0) the
+    parametric bands reuse the non-parametric names with a suffix:
+    "vel_Halpha_6562.85_pek", "vel_Halpha_6562.85_pm". In the older layout
+    the parametric table is long, pivoted on wavelength to
+    "vel_pek_6562.85" and "vel_pe_6562.85", formatted to two decimals --
+    the same two decimals as the non-parametric stem. Both are tried.
+    """
+    m = re.search(r"_(\d+(?:\.\d+)?)$", stem)
+    wl = f"{float(m.group(1)):.2f}" if m else None
+    if source == "np":
+        return [f"{prefix}_{stem}"]
+    if source == "pek":
+        return [f"{prefix}_{stem}_pek"] + ([f"{prefix}_pek_{wl}"] if wl else [])
+    if source == "pe":
+        return [f"{prefix}_{stem}_pm"] + ([f"{prefix}_pe_{wl}"] if wl else [])
+    raise ValueError(f"unknown kinematics source {source!r}; "
+                     f"expected one of {KINEMATIC_SOURCES} or 'auto'")
+
+
+def _resolve_kinematics_source(colnames, lines: Sequence[str],
+                               source: str = "auto") -> str:
+    """
+    Pick one source for the whole read.
+
+    One source for every line, never a per-line mixture: a velocity map
+    whose planes came from different estimators would be quietly
+    inconsistent. "auto" takes the first source in KINEMATIC_SOURCES that
+    has a velocity column for any requested line.
+    """
+    if source != "auto":
+        if source not in KINEMATIC_SOURCES:
+            raise ValueError(f"kinematics_source must be 'auto' or one of "
+                             f"{KINEMATIC_SOURCES}, got {source!r}")
+        return source
+    names = set(colnames)
+    for src in KINEMATIC_SOURCES:
+        for ln in lines:
+            stem = _line_stem(LINE_DEFS[ln][0])
+            if any(c in names for c in _kin_candidates("vel", stem, src)):
+                return src
+    return "np"
+
 _FLUX_PREFIX = "flux_"
 
 
@@ -180,6 +246,7 @@ def _kinematics_columns(
     lines: Sequence[str],
     rows: np.ndarray,
     prefixes: Sequence[str] = KINEMATIC_PREFIXES,
+    source: str = "np",
 ) -> dict:
     """
     Velocity and dispersion columns for the requested lines, pulled through
@@ -201,9 +268,10 @@ def _kinematics_columns(
     for ln in lines:
         stem = _line_stem(LINE_DEFS[ln][0])
         for pre in prefixes:
-            col = f"{pre}_{stem}"
-            if col not in names:
-                missing.append(col)
+            cands = _kin_candidates(pre, stem, source)
+            col = next((c for c in cands if c in names), None)
+            if col is None:
+                missing.append(cands[0])
                 continue
             c = dap_tbl[col]
             if hasattr(c, "filled"):
@@ -1104,6 +1172,7 @@ def read_dap_multi(
     mask_source: str = "auto",
     assume_all_science="auto",
     verbose: bool = True,
+    kinematics_source: str = "auto",
 ) -> FiberSet:
     """
     Read an LVM dap file + fibermap YAML and return FiberSet
@@ -1166,6 +1235,14 @@ def read_dap_multi(
         errors, to the catalog -- derived from the line's flux column stem,
         see the module docstring. Columns absent from the file are reported
         and skipped. Default True.
+
+    kinematics_source : {"auto", "pek", "pe", "np"}
+        Which of the DAP's velocity estimates to read; see KINEMATIC_SOURCES.
+        "auto" (default) takes the second-pass parametric fit when the file
+        has it -- the estimate the LVM Helix paper maps -- then the first
+        pass, then the non-parametric moments. The choice is printed and
+        stored in meta["kinematics_source"]. Catalog keys stay vel_<line>,
+        e_vel_<line>, ... whichever source supplies them.
 
     Returns
     -------
@@ -1284,8 +1361,18 @@ def read_dap_multi(
     for i, ln in enumerate(line_names):
         fibercat[f"flux_{ln}"] = flux[:, i]
         fibercat[f"ivar_{ln}"] = ivar[:, i]
+    kin_source = None
     if kinematics:
-        fibercat.update(_kinematics_columns(dap_tbl, line_names, rows))
+        kin_source = _resolve_kinematics_source(dap_tbl.colnames, line_names,
+                                                kinematics_source)
+        if verbose:
+            label = {"pek": "second-pass parametric fit",
+                     "pe": "first-pass parametric fit",
+                     "np": "non-parametric moments"}[kin_source]
+            print(f"[kin] velocities and dispersions from {kin_source!r} "
+                  f"({label})")
+        fibercat.update(_kinematics_columns(dap_tbl, line_names, rows,
+                                            source=kin_source))
     if extra_cols:
         fibercat.update(_catalog_columns(dap_tbl, extra_cols, rows))
 
@@ -1302,7 +1389,8 @@ def read_dap_multi(
             line_names=line_names,
             fibercat=fibercat,
             fibermask=fibermask,
-            mask_info=mask_info,),
+            mask_info=mask_info,
+            kinematics_source=kin_source,),
     )
 
 
@@ -1316,6 +1404,7 @@ def read_dap(
     mask_source: str = "auto",
     assume_all_science="auto",
     verbose: bool = True,
+    kinematics_source: str = "auto",
 ) -> FiberSet:
     """
     Single-line (Halpha) DAP reader.
@@ -1338,4 +1427,5 @@ def read_dap(
         mask_source=mask_source,
         assume_all_science=assume_all_science,
         verbose=verbose,
+        kinematics_source=kinematics_source,
     )
