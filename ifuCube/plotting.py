@@ -476,7 +476,7 @@ def _title(target, wave, i, lo, hi, names):
 # ---------------------------------------------------------------------------
 
 def show_fibers(cat, c, label="", s=16, cmap="RdBu_r", pct=(2, 98), ax=None,
-                colorbar=True, east_left=True, **kw):
+                colorbar=True, east_left=True, vmin=None, vmax=None, **kw):
     """
     The fibres themselves, in tangent-plane arcsec -- no resampling.
 
@@ -495,6 +495,13 @@ def show_fibers(cat, c, label="", s=16, cmap="RdBu_r", pct=(2, 98), ax=None,
         read_map(...)["fibercat"]).
     c : (K,) array
         The quantity to colour by. Non-finite entries are dropped.
+    vmin, vmax : float, optional
+        Explicit colour limits; each overrides the matching `pct` bound. Pass
+        both, symmetric about zero, for a signed quantity on a diverging
+        colormap -- a velocity relative to systemic, say -- so that the
+        neutral colour sits at zero rather than wherever the percentiles
+        happen to put it. Use the same limits as the matching show_map call
+        so the fibres and the map can be compared colour for colour.
     """
     for key in ("x_arcsec", "y_arcsec"):
         if key not in getattr(cat, "colnames", cat):
@@ -517,6 +524,10 @@ def show_fibers(cat, c, label="", s=16, cmap="RdBu_r", pct=(2, 98), ax=None,
     if ax is None:
         _, ax = plt.subplots(figsize=(5.2, 4.6))
     lo, hi = np.percentile(v[good], pct)
+    if vmin is not None:
+        lo = vmin
+    if vmax is not None:
+        hi = vmax
     sc = ax.scatter(xs[good], ys[good], c=v[good], s=s, cmap=cmap,
                     vmin=lo, vmax=hi, **kw)
     if colorbar:
