@@ -1259,6 +1259,351 @@ def plot_matched_regions(
     return fig
 
 
+
+# ---------------------------------------------------------------------------
+# Sparse table -> image, in any projection, without a full-sky array
+# ---------------------------------------------------------------------------
+#
+# healpy's gnomview/mollview want a full-sky array of 12 * nside**2 values.
+# At nside 4096 that is 201 million pixels (1.6 GB as float64) to display a
+# few million that hold data, and at nside 131072 it is 2e11 and cannot be
+# allocated at all. A gnomonic or Mollweide picture does not need it: lay down
+# the image grid you want to look at, ask which HEALPix pixel each grid cell
+# falls in, and look that pixel up in the sparse table. That is all gnomview
+# does internally, and here it costs memory proportional to the IMAGE, not to
+# the sky.
+
+# CTYPE axis names for each COORDSYS this module writes, padded to the four
+# characters the FITS convention wants before "-<proj>".
+_HP_FRAMES = {
+    "GALACTIC": ("GLON", "GLAT", "galactic"),
+    "G": ("GLON", "GLAT", "galactic"),
+    "ICRS": ("RA--", "DEC-", "icrs"),
+    "C": ("RA--", "DEC-", "icrs"),
+    "CELESTIAL": ("RA--", "DEC-", "icrs"),
+    "EQUATORIAL": ("RA--", "DEC-", "icrs"),
+}
+
+# Half-extent of the projection plane, in degrees, for the all-sky
+# projections: Mollweide and Hammer-Aitoff share the bounding ellipse
+# x = +/- 2*sqrt(2)*180/pi, y = +/- sqrt(2)*180/pi.
+_ALLSKY_HALF = {
+    "MOL": (2 * np.sqrt(2) * 180 / np.pi, np.sqrt(2) * 180 / np.pi),
+    "AIT": (2 * np.sqrt(2) * 180 / np.pi, np.sqrt(2) * 180 / np.pi),
+    "CAR": (180.0, 90.0),
+}
+
+
+def _read_sparse_healpix(path, column, weight_column):
+    """PIXEL, values, weights and the header facts, from a table this module wrote."""
+    with fits.open(path) as h:
+        hdr = h[0].header
+        data = h[1].data
+        names = list(data.names)
+        if column not in names:
+            raise KeyError(f"no column {column!r} in {path}. Available: {names}")
+        pix = np.asarray(data["PIXEL"], np.int64)
+        val = np.asarray(data[column], float)
+        if weight_column and weight_column in names:
+            w = np.asarray(data[weight_column], float)
+        else:
+            w = np.ones_like(val)
+    nside = int(hdr["NSIDE"])
+    order = str(hdr.get("ORDERING", "NESTED")).strip().lower()
+    coordsys = str(hdr.get("COORDSYS", "ICRS")).strip().upper()
+    if coordsys not in _HP_FRAMES:
+        raise ValueError(f"COORDSYS={coordsys!r} not understood; expected one of "
+                         f"{sorted(_HP_FRAMES)}")
+    return pix, val, w, nside, order, coordsys, hdr
+
+
+def healpix_image(
+    path,
+    center=None,
+    width_deg: float = 1.0,
+    height_deg: Optional[float] = None,
+    proj: str = "TAN",
+    pixel_arcsec: Optional[float] = None,
+    xsize: int = 1600,
+    column: str = "VALUE",
+    weight_column: Optional[str] = None,
+) -> Dict[str, object]:
+    """
+    Project a sparse HEALPix table onto a regular image with a WCS.
+
+    The image is an ordinary 2D array with an ordinary celestial WCS, so
+    everything that draws a map draws this too -- plotting.show_map, a
+    contour overlay, reproject onto another survey, a FITS file for DS9.
+
+    Parameters
+    ----------
+    path : str or Path
+        A table written by wcs_fits_to_healpix_table or
+        merge_healpix_tables (NSIDE, ORDERING and COORDSYS are read from its
+        header, so they cannot be given wrongly).
+    center : (lon, lat) in degrees, or SkyCoord, optional
+        Image centre. A tuple is taken to be in the table's own frame --
+        Galactic (l, b) for the pipeline's tables. A SkyCoord in any frame
+        is transformed, so SkyCoord.from_name("NGC 7293") works directly.
+        Default: (0, 0) for the all-sky projections; for a cut-out, the
+        mean direction of the data.
+    width_deg, height_deg : float
+        Cut-out size, for proj="TAN" or a partial "CAR". Height defaults to
+        the width. Ignored for "MOL" and "AIT", which always show the whole
+        sky.
+    proj : {"TAN", "MOL", "AIT", "CAR"}
+        "TAN" is gnomonic -- what healpy calls gnomview -- for a zoomed
+        cut-out. "MOL" is Mollweide (mollview), "AIT" Hammer-Aitoff, "CAR"
+        plain longitude-latitude (cartview).
+    pixel_arcsec : float, optional
+        Image cell size for TAN/CAR. Default: half the HEALPix pixel size,
+        so the cut-out shows the table at its native resolution -- unless
+        that would exceed `xsize` cells, in which case the cells grow and
+        the table is averaged into them (see below).
+    xsize : int
+        Image width in cells for the all-sky projections, and the cap on the
+        long side of a cut-out when pixel_arcsec is not given.
+    column : str
+        Which value column to show: "VALUE" for a single-line table,
+        "VALUE0", "VALUE1", ... for a multi-line one, or "NSAMP" / "WEIGHT"
+        to see coverage and depth.
+    weight_column : str, optional
+        Used only when cells are averaged (see below). Defaults to the
+        WEIGHT column matching `column` (VALUE1 -> WEIGHT1), falling back to
+        equal weights.
+
+    Returns
+    -------
+    dict with
+        "image"         (ny, nx) array, NaN where the sky has no data or
+                        lies outside the projection
+        "wcs"           the image's celestial WCS
+        "nside"         the table's NSIDE
+        "nside_sampled" the NSIDE the image was actually sampled at
+        "frame"         "galactic" or "icrs"
+        "bunit"         the table's BUNIT
+        "center"        (lon, lat) used, in the table's frame
+        "on_sky"        (ny, nx) bool, False outside the projection's
+                        boundary (the corners of a Mollweide image)
+
+    Coarsening, and why it averages
+    -------------------------------
+    A cut-out samples each image cell at the native NSIDE. A whole-sky view
+    cannot: at 1600 cells across, each cell spans about 0.2 degrees, while
+    an NSIDE 4096 pixel spans 52 arcsec. Sampling only the HEALPix pixel at
+    each cell's centre would hit data in a tiny fraction of cells and draw
+    the survey as near-invisible specks. So when a cell is larger than a
+    HEALPix pixel, the table is first coarsened to the largest NSIDE whose
+    pixels are at least as big as a cell, each coarse pixel taking the
+    weighted mean of the fine pixels that fall inside it. Averaging is right
+    because the values are surface brightness -- intensive, so the coarse
+    value is the mean brightness over what was measured. (Summing would be
+    right only for an extensive quantity like flux per pixel, which these
+    tables do not hold.) "nside_sampled" reports which NSIDE was used.
+    """
+    from astropy.coordinates import SkyCoord
+    from astropy_healpix import HEALPix
+
+    proj = str(proj).upper()
+    if proj not in ("TAN", "MOL", "AIT", "CAR"):
+        raise ValueError(f"proj must be TAN, MOL, AIT or CAR, got {proj!r}")
+    if weight_column is None and column.startswith("VALUE"):
+        weight_column = "WEIGHT" + column[len("VALUE"):]
+
+    pix, val, w, nside, order, coordsys, hdr = _read_sparse_healpix(
+        path, column, weight_column)
+    lon_ax, lat_ax, frame = _HP_FRAMES[coordsys]
+    src = HEALPix(nside=nside, order=order, frame=frame)
+    native_arcsec = src.pixel_resolution.to(u.arcsec).value
+
+    # ---- centre, in the table's frame ------------------------------------
+    allsky = proj in ("MOL", "AIT")
+    if center is None:
+        if allsky or (proj == "CAR" and width_deg >= 360):
+            lon0, lat0 = 0.0, 0.0
+        else:
+            # Mean of unit vectors, not of angles: a field straddling l = 0
+            # has longitudes near 0 and near 360, whose plain mean is 180.
+            plon, plat = src.healpix_to_lonlat(pix)
+            plon, plat = plon.to_value(u.rad), plat.to_value(u.rad)
+            v = np.array([np.cos(plat) * np.cos(plon),
+                          np.cos(plat) * np.sin(plon),
+                          np.sin(plat)]).mean(axis=1)
+            if np.linalg.norm(v) < 0.5:
+                raise ValueError(
+                    "the data is spread too widely over the sky for a single "
+                    "cut-out centre; pass center=(lon, lat) or a SkyCoord, or "
+                    "use proj='MOL' for an all-sky view")
+            lon0 = float(np.degrees(np.arctan2(v[1], v[0])) % 360)
+            lat0 = float(np.degrees(np.arcsin(v[2] / np.linalg.norm(v))))
+    elif isinstance(center, SkyCoord):
+        c = center.transform_to(frame)
+        lon0 = float(c.spherical.lon.deg)
+        lat0 = float(c.spherical.lat.deg)
+    else:
+        lon0, lat0 = float(center[0]), float(center[1])
+
+    # ---- image grid and WCS ---------------------------------------------
+    if allsky:
+        half_x, half_y = _ALLSKY_HALF[proj]
+        nx = int(xsize)
+        cdelt = 2 * half_x / nx
+        ny = int(np.ceil(2 * half_y / cdelt))
+        crval = (lon0, 0.0)          # MOL/AIT are only defined about lat 0
+    else:
+        h_deg = width_deg if height_deg is None else height_deg
+        if proj == "CAR" and center is None and width_deg >= 360:
+            h_deg = 180.0 if height_deg is None else height_deg
+        if pixel_arcsec:
+            step = pixel_arcsec / 3600.0
+        else:
+            # Native resolution for a cut-out, but no more than `xsize` cells
+            # along the long side: a 40-degree strip at 26 arcsec would be
+            # 5500 cells across and gain nothing on screen.
+            step = max(native_arcsec / 2 / 3600.0,
+                       max(width_deg, h_deg) / int(xsize))
+        cdelt = step
+        nx = max(2, int(np.ceil(width_deg / step)))
+        ny = max(2, int(np.ceil(h_deg / step)))
+        if nx * ny > 50_000_000:
+            raise ValueError(
+                f"a {nx} x {ny} image is too large; raise pixel_arcsec or "
+                f"shrink width_deg/height_deg")
+        crval = (lon0, lat0)
+
+    wcs = WCS(naxis=2)
+    wcs.wcs.ctype = [f"{lon_ax}-{proj}", f"{lat_ax}-{proj}"]
+    wcs.wcs.crval = list(crval)
+    # Longitude increases to the LEFT, the convention for sky images and for
+    # healpy's own views; latitude up.
+    wcs.wcs.cdelt = [-cdelt, cdelt]
+    wcs.wcs.crpix = [(nx + 1) / 2.0, (ny + 1) / 2.0]
+    if proj == "CAR" and crval[1] != 0:
+        # CAR with a non-zero reference latitude is an OBLIQUE projection in
+        # FITS -- the grid is rotated and parallels curve. Keep the
+        # reference on the equator and move the reference pixel instead, so
+        # l and b stay straight axes.
+        wcs.wcs.crval = [crval[0], 0.0]
+        wcs.wcs.crpix = [(nx + 1) / 2.0, (ny + 1) / 2.0 - crval[1] / cdelt]
+    wcs.wcs.cunit = ["deg", "deg"]
+    wcs.array_shape = (ny, nx)
+
+    # ---- coarsen if a cell is bigger than a HEALPix pixel ----------------
+    cell_arcsec = cdelt * 3600.0
+    k = 0
+    if cell_arcsec > native_arcsec:
+        k = int(np.ceil(np.log2(cell_arcsec / native_arcsec)))
+        k = min(k, int(np.log2(nside)))          # never below NSIDE 1
+    nside_eff = nside >> k
+
+    good = np.isfinite(val)
+    if k == 0:
+        keys = pix[good]
+        vals = val[good]
+        look = src
+    else:
+        # Each fine pixel lies wholly inside one coarse pixel whatever the
+        # ordering, so the coarse pixel containing its CENTRE is its parent.
+        # That sidesteps converting RING tables to NESTED first.
+        look = HEALPix(nside=nside_eff, order="nested", frame=frame)
+        plon, plat = src.healpix_to_lonlat(pix[good])
+        parent = look.lonlat_to_healpix(plon, plat)
+        ww = np.where(np.isfinite(w[good]) & (w[good] > 0), w[good], 0.0)
+        if not np.any(ww > 0):
+            ww = np.ones_like(ww)
+        keys, inv = np.unique(parent, return_inverse=True)
+        wsum = np.bincount(inv, weights=ww)
+        vsum = np.bincount(inv, weights=ww * val[good])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            vals = vsum / wsum
+        keep = wsum > 0
+        keys, vals = keys[keep], vals[keep]
+
+    order_idx = np.argsort(keys)
+    keys, vals = keys[order_idx], vals[order_idx]
+
+    # ---- sample -----------------------------------------------------------
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    lon, lat = wcs.pixel_to_world_values(xx.ravel(), yy.ravel())
+    on_sky = np.isfinite(lon) & np.isfinite(lat)
+
+    flat = np.full(nx * ny, np.nan)
+    if keys.size and on_sky.any():
+        hp_idx = look.lonlat_to_healpix(lon[on_sky] * u.deg, lat[on_sky] * u.deg)
+        pos = np.clip(np.searchsorted(keys, hp_idx), 0, keys.size - 1)
+        hit = keys[pos] == hp_idx
+        sampled = np.full(hp_idx.shape, np.nan)
+        sampled[hit] = vals[pos[hit]]
+        flat[on_sky] = sampled
+
+    return dict(image=flat.reshape(ny, nx), wcs=wcs, nside=nside,
+                on_sky=on_sky.reshape(ny, nx),
+                nside_sampled=nside_eff, frame=frame,
+                bunit=str(hdr.get("BUNIT", "")), center=(lon0, lat0))
+
+
+def plot_healpix_image(path, ax=None, stretch="asinh", cmap="inferno",
+                       pct=(1, 99.5), label=None, title=None, **image_kwargs):
+    """
+    Draw a sparse HEALPix table -- gnomview / mollview / cartview, from the
+    table on disk, at any NSIDE.
+
+    All of healpix_image's arguments pass through (center, width_deg, proj,
+    pixel_arcsec, xsize, column, ...), and the drawing is plotting.show_map,
+    so the stretch, colour limits and colormap behave as they do for every
+    other map in the package. An asinh stretch is the default because
+    surface-brightness maps carry noise about zero, and a log stretch would
+    render every non-positive cell as a hole. Sky with no data is drawn pale
+    grey; in "MOL"/"AIT" the white outside the ellipse is not sky.
+
+    On an all-sky view a single field is a few cells at most -- a 0.5 degree
+    field is about two cells of a 1600-wide Mollweide. That view is for the
+    survey's footprint; look at one object with a cut-out.
+
+    Returns
+    -------
+    (ax, result) -- the axes, and healpix_image's dict, so the image and WCS
+    can be reused (saved, contoured, compared) without projecting again.
+
+    Examples
+    --------
+        # zoomed cut-out on one source, native resolution
+        plot_healpix_image("merged_halpha.fits",
+                           center=SkyCoord.from_name("NGC 7293"), width_deg=1)
+
+        # whole survey footprint, Mollweide, Galactic
+        plot_healpix_image("merged_halpha.fits", proj="MOL")
+
+        # a strip of the Galactic plane
+        plot_healpix_image("merged_halpha.fits", proj="CAR",
+                           center=(30, 0), width_deg=40, height_deg=6,
+                           pixel_arcsec=60)
+    """
+    import matplotlib.pyplot as plt
+    from .plotting import show_map
+
+    res = healpix_image(path, **image_kwargs)
+    allsky = str(image_kwargs.get("proj", "TAN")).upper() in ("MOL", "AIT")
+    if ax is None:
+        fig = plt.figure(figsize=(10, 5.2) if allsky else (6, 5.2))
+        ax = fig.add_subplot(projection=res["wcs"])
+
+    # The sky itself in pale grey, so empty sky reads as "observed nothing"
+    # and the white beyond the Mollweide ellipse reads as "not sky".
+    ax.imshow(np.where(res["on_sky"], 1.0, np.nan), cmap="Greys",
+              vmin=0, vmax=8, origin="lower", interpolation="nearest")
+
+    show_map(res["image"], wcs=res["wcs"], ax=ax, stretch=stretch, cmap=cmap,
+             pct=pct, label=label if label is not None else res["bunit"],
+             title=title, grid=False, interpolation="nearest")
+    ax.coords.grid(color="0.45", alpha=0.5, ls=":", lw=0.6)
+
+    gal = res["frame"] == "galactic"
+    ax.set_xlabel("Galactic longitude  l" if gal else "RA")
+    ax.set_ylabel("Galactic latitude  b" if gal else "Dec")
+    return ax, res
+
+
 def main() -> None:
     import argparse
 
