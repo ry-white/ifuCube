@@ -297,9 +297,24 @@ def wcs_fits_to_healpix_table(
     pix_area = None
     intensive = bunit_in.lower() in ("", "ratio", "dimensionless", "1",
                                      "km/s", "angstrom", "arcsec")
+    # Already surface brightness? save_map_to_fits and save_cube_to_fits
+    # both write SBCONV=T when they have divided by the pixel area, and
+    # maps now do so by default. Without this check the conversion below
+    # would run AGAIN on such a file -- a silent factor of PIXAR_A2 (81x at
+    # 9" pixels) and a BUNIT of flux/arcsec**2/arcsec**2. The BUNIT test is
+    # a fallback for files written by something that set the unit but not
+    # the flag.
+    already_sb = (bool(in_hdr.get("SBCONV", False))
+                  or "/arcsec**2" in bunit_in.lower().replace(" ", ""))
+    if to_surface_brightness and already_sb:
+        print(f"[note] input is already surface brightness "
+              f"(BUNIT={bunit_in!r}, SBCONV={in_hdr.get('SBCONV', 'absent')}); "
+              f"not converting again")
+        intensive = True
     if to_surface_brightness and intensive and bunit_in:
-        print(f"[note] BUNIT={bunit_in!r} looks intensive; skipping the "
-              f"surface-brightness conversion")
+        if not already_sb:
+            print(f"[note] BUNIT={bunit_in!r} looks intensive; skipping the "
+                  f"surface-brightness conversion")
     elif to_surface_brightness:
         from astropy.wcs.utils import proj_plane_pixel_area
         pix_area = float(proj_plane_pixel_area(wcs2d)) * 3600.0 ** 2  # arcsec^2
@@ -361,7 +376,11 @@ def wcs_fits_to_healpix_table(
     # Record the units convention so a merge can refuse to mix them and a
     # reader never has to guess what VALUE means.
     primary.header["BUNIT"] = (bunit_out, "units of the VALUE column(s)")
-    primary.header["SBCONV"] = (bool(pix_area is not None),
+    # True if the VALUE columns ARE surface brightness -- whether this call
+    # converted them or the input already was. Downstream code keys off this
+    # to decide whether an area conversion is still owed, so it must describe
+    # the values, not this function's actions.
+    primary.header["SBCONV"] = (bool(pix_area is not None or already_sb),
                                 "T if divided by input pixel area")
     if pix_area is not None:
         primary.header["PIXAR_A2"] = (pix_area, "input map pixel area [arcsec**2]")
