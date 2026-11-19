@@ -297,24 +297,9 @@ def wcs_fits_to_healpix_table(
     pix_area = None
     intensive = bunit_in.lower() in ("", "ratio", "dimensionless", "1",
                                      "km/s", "angstrom", "arcsec")
-    # Already surface brightness? save_map_to_fits and save_cube_to_fits
-    # both write SBCONV=T when they have divided by the pixel area, and
-    # maps now do so by default. Without this check the conversion below
-    # would run AGAIN on such a file -- a silent factor of PIXAR_A2 (81x at
-    # 9" pixels) and a BUNIT of flux/arcsec**2/arcsec**2. The BUNIT test is
-    # a fallback for files written by something that set the unit but not
-    # the flag.
-    already_sb = (bool(in_hdr.get("SBCONV", False))
-                  or "/arcsec**2" in bunit_in.lower().replace(" ", ""))
-    if to_surface_brightness and already_sb:
-        print(f"[note] input is already surface brightness "
-              f"(BUNIT={bunit_in!r}, SBCONV={in_hdr.get('SBCONV', 'absent')}); "
-              f"not converting again")
-        intensive = True
     if to_surface_brightness and intensive and bunit_in:
-        if not already_sb:
-            print(f"[note] BUNIT={bunit_in!r} looks intensive; skipping the "
-                  f"surface-brightness conversion")
+        print(f"[note] BUNIT={bunit_in!r} looks intensive; skipping the "
+              f"surface-brightness conversion")
     elif to_surface_brightness:
         from astropy.wcs.utils import proj_plane_pixel_area
         pix_area = float(proj_plane_pixel_area(wcs2d)) * 3600.0 ** 2  # arcsec^2
@@ -376,11 +361,7 @@ def wcs_fits_to_healpix_table(
     # Record the units convention so a merge can refuse to mix them and a
     # reader never has to guess what VALUE means.
     primary.header["BUNIT"] = (bunit_out, "units of the VALUE column(s)")
-    # True if the VALUE columns ARE surface brightness -- whether this call
-    # converted them or the input already was. Downstream code keys off this
-    # to decide whether an area conversion is still owed, so it must describe
-    # the values, not this function's actions.
-    primary.header["SBCONV"] = (bool(pix_area is not None or already_sb),
+    primary.header["SBCONV"] = (bool(pix_area is not None),
                                 "T if divided by input pixel area")
     if pix_area is not None:
         primary.header["PIXAR_A2"] = (pix_area, "input map pixel area [arcsec**2]")
@@ -997,9 +978,11 @@ def download_lvm_files(
     Returns
     -------
     destinations : list of str
-        Local file paths for the rows actually queued (existing after a
-        real run; the paths *would* exist after a dry run). Rows dropped
-        by skip_missing are not included.
+        Local paths of every file ready to process, in input order: files
+        already on disk (skipped by skip_existing_local) PLUS files just
+        downloaded. After a real run only paths that exist are returned;
+        after a dry run, the paths that would exist. Rows dropped by
+        skip_missing are not included.
     """
     if method not in ("rsync", "http"):
         raise ValueError(f"method must be 'rsync' or 'http', got {method!r}")
@@ -1034,13 +1017,17 @@ def download_lvm_files(
         row_kwargs_list.append(row_kwargs)
         destinations.append(a.full(filetype, **row_kwargs))
 
+    import os as _os
+    all_dest = list(destinations)          # every requested file, in input order
+    already_local: list = []
+
     if skip_existing_local:
-        import os as _os
         kept_kwargs, kept_dest = [], []
         n_already_have = 0
         for kwargs, dest in zip(row_kwargs_list, destinations):
             if _os.path.exists(dest):
                 n_already_have += 1
+                already_local.append(dest)
             else:
                 kept_kwargs.append(kwargs)
                 kept_dest.append(dest)
@@ -1080,7 +1067,14 @@ def download_lvm_files(
         for kwargs, dest in zip(row_kwargs_list, destinations):
             print(f"    {kwargs} -> {dest}")
         print("Re-run with dry_run=False to actually download.")
-        return destinations
+        keep = set(already_local) | set(destinations)
+        return [d for d in all_dest if d in keep]
+
+    # sdss_access raises AccessError("No files to download.") on an empty
+    # rsync stream, so stop here when everything is already on disk.
+    if not row_kwargs_list:
+        print(f"[ok] Nothing to download -- all {len(already_local)} requested file(s) already on disk")
+        return [d for d in all_dest if _os.path.exists(d)]
 
     if method == "rsync":
         a.remote(username=username, password=password, inquire=(username is None and password is None))
@@ -1094,7 +1088,7 @@ def download_lvm_files(
             a.get(filetype, **kwargs)
 
     print(f"[ok] Downloaded {n} file(s) via {method} (filetype={filetype}, release={release})")
-    return destinations
+    return [d for d in all_dest if _os.path.exists(d)]
 
 
 def plot_matched_regions(
